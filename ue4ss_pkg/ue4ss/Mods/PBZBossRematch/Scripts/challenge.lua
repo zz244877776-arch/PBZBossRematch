@@ -22,6 +22,7 @@ local PLAYER_HEIGHT_OFFSET = 120
 local RELOAD_TIMEOUT_S = 20
 local RELOAD_MIN_S = 5
 local SCAN_STABLE_REGIONS = 3
+local STAGE_WAIT_S = 6
 
 -- idle -> traveling -> locating [-> scanning -> traveling -> locating] -> spawning -> fighting -> ending -> reloading -> idle
 local st = { phase = "idle" }
@@ -64,6 +65,11 @@ local function travel(level, transform, bellId)
     st.arrivedAt = nil
     setPhase("traveling")
     return true
+end
+
+local function isDead(actor)
+    local ok, v = pcall(function() return actor:IsDead() end)
+    return ok and v == true
 end
 
 local function pawnAddress()
@@ -199,7 +205,7 @@ local function startSpawn(spawner)
     st.spawner = spawner
     st.spawnerLoc = U.location(spawner)
     local hasAI = false
-    pcall(function() hasAI = U.valid(spawner.SpawnedAI) end)
+    pcall(function() hasAI = U.valid(spawner.SpawnedAI) and not isDead(spawner.SpawnedAI) end)
     if not hasAI then
         pcall(function() spawner.ShouldSpawn = true end)
         pcall(function() spawner.SpawnerSaveInfo.IsAlive = true end)
@@ -329,29 +335,72 @@ end
 local function tickSpawning()
     local ai = nil
     pcall(function() ai = st.spawner.SpawnedAI end)
-    if U.valid(ai) then
+    if U.valid(ai) and not isDead(ai) then
         st.bossPawn = ai
         placePlayerNearBoss()
         setPhase("fighting")
-        Toast.show("挑战开始：" .. st.boss.name, 3000)
+        Toast.show((st.rootBoss and "下一阶段：" or "挑战开始：") .. st.boss.name, 3000)
         return
     end
     if not st.altSpawnTried and elapsed() > ALT_SPAWN_AFTER_S then
         st.altSpawnTried = true
         trySequenceSpawn(st.spawner)
     end
-    if elapsed() > SPAWN_TIMEOUT_S then abort("Boss 没有出现") end
+    if elapsed() > SPAWN_TIMEOUT_S then
+        abort(st.rootBoss and (st.boss.name .. " 没有出现，挑战结束") or "Boss 没有出现")
+    end
 end
 
-local function isDead(actor)
-    local ok, v = pcall(function() return actor:IsDead() end)
-    return ok and v == true
+local function victory()
+    local name = (st.rootBoss or st.boss).name
+    Toast.show("挑战成功：" .. name .. "，即将返回", Config.VictoryReturnDelayMs)
+    returnToStart("victory", Config.VictoryReturnDelayMs)
+end
+
+local function livePawnOf(boss)
+    for _, a in ipairs(FindAllOf(boss.class) or {}) do
+        if U.valid(a) and not isDead(a) then return a end
+    end
+    return nil
+end
+
+local function enterStage(stage, pawn)
+    st.boss = stage
+    st.bossPawn = pawn
+    st.bossDied = false
+    U.log("stage %s is up", stage.id)
+    Toast.show("下一阶段：" .. stage.name, 3000)
+    setPhase("fighting")
+end
+
+-- After a phase dies the game may run its own transition; give it a moment, then spawn the next phase ourselves.
+local function tickTransition()
+    local stage = st.nextStage
+    local pawn = livePawnOf(stage)
+    if pawn then return enterStage(stage, pawn) end
+    if elapsed() < STAGE_WAIT_S then return end
+    local spawner = Data.findSpawner(stage.class)
+    if not spawner then
+        U.log("no spawner for %s, finishing after %s", stage.id, st.boss.id)
+        return victory()
+    end
+    U.log("spawning next stage %s", stage.id)
+    st.rootBoss = st.rootBoss or st.boss
+    st.boss = stage
+    startSpawn(spawner)
 end
 
 local function tickFighting()
     if st.bossDied or not U.valid(st.bossPawn) or isDead(st.bossPawn) then
-        Toast.show("挑战成功：" .. st.boss.name .. "，即将返回", Config.VictoryReturnDelayMs)
-        return returnToStart("victory", Config.VictoryReturnDelayMs)
+        local nextStage = Data.nextStage(st.boss)
+        if nextStage then
+            U.log("%s down, waiting for %s", st.boss.id, nextStage.id)
+            st.rootBoss = st.rootBoss or st.boss
+            st.nextStage = nextStage
+            st.bossPawn = nil
+            return setPhase("transition")
+        end
+        return victory()
     end
     if st.playerDied then
         Toast.show("挑战失败，即将返回", Config.DefeatReturnDelayMs)
@@ -414,6 +463,7 @@ function M.tick()
     elseif p == "scanning" then tickScanning()
     elseif p == "spawning" then tickSpawning()
     elseif p == "fighting" then tickFighting()
+    elseif p == "transition" then tickTransition()
     elseif p == "reloading" then tickReloading()
     end
 end
@@ -428,7 +478,7 @@ end
 
 function M.onPlayerDeadWidget()
     local p = st.phase
-    if p == "fighting" or p == "spawning" or p == "locating" or p == "scanning" or p == "traveling" then
+    if p == "fighting" or p == "transition" or p == "spawning" or p == "locating" or p == "scanning" or p == "traveling" then
         U.log("player died")
         st.playerDied = true
         if p ~= "fighting" then returnToStart("defeat", Config.DefeatReturnDelayMs) end

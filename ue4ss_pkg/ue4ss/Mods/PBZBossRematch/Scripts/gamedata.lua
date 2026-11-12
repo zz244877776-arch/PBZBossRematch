@@ -48,7 +48,30 @@ function M.bosses()
     end)
     table.sort(rows, function(a, b) return a.order < b.order end)
     if #rows > 0 then bossRows = rows end
+    -- A second phase is reached through its first phase; one without a first phase on its map is a fight of its own.
+    local chained = {}
+    for _, b in ipairs(rows) do
+        local nxt = M.nextStage(b)
+        if nxt then chained[nxt.id] = true end
+    end
+    for _, b in ipairs(rows) do
+        if b.hidden and string.find(b.id, "_P2$") and not chained[b.id] then b.hidden = false end
+    end
     return rows
+end
+
+-- Multi-phase bosses keep each phase in its own class on the same map, e.g. LionDancer ->
+-- LionDancer_P2, ChangHong_Spear -> ChangHong_P2, ZuoShang_Ending -> ZuoShang_P2.
+function M.nextStage(boss)
+    if string.find(boss.id, "_P2$") then return nil end
+    for _, b in ipairs(M.bosses()) do
+        local base = string.match(b.id, "^(.+)_P2$")
+        if base and b.map == boss.map
+            and (boss.id == base or string.sub(boss.id, 1, #base + 1) == base .. "_") then
+            return b
+        end
+    end
+    return nil
 end
 
 function M.bossByClass(cls)
