@@ -55,11 +55,14 @@ function Find-SteamGame {
 
 function Get-SteamSaveIds([string]$root) {
     $dir = Join-Path $root 'ProjectPBZ\Saved\SaveGames\Steam'
-    if (-not (Test-Path -LiteralPath $dir)) { return @() }
-    return @(Get-ChildItem -LiteralPath $dir -Directory |
+    if (-not (Test-Path -LiteralPath $dir)) { return ,@() }
+    # The comma keeps a one-element result an array. Without it PowerShell
+    # returns a string, and $ids[0] is the first character of the Steam id.
+    $names = @(Get-ChildItem -LiteralPath $dir -Directory |
         Where-Object { $_.Name -match '^\d+$' } |
         Sort-Object LastWriteTime -Descending |
         ForEach-Object { $_.Name })
+    return ,$names
 }
 
 function Test-GameRunning([string]$root) {
@@ -162,7 +165,7 @@ function Install-Mod([string]$root, [bool]$installUe4ss, [bool]$backupSaves, [sc
     & $log ($(if ($skipMod.Count) { "已更新 Mod 脚本（保留了你原有的 config.lua 设置）。" } else { "已安装 Mod 脚本。" }))
 
     $ids = Get-SteamSaveIds $root
-    $steamId = if ($ids.Count -gt 0) { $ids[0] } else { '' }
+    $steamId = if ($ids.Count -gt 0) { [string]$ids[0] } else { '' }
     Update-ModConfig $configPath $root $steamId
     if ($steamId) {
         & $log "存档文件夹：ProjectPBZ\Saved\SaveGames\Steam\$steamId"

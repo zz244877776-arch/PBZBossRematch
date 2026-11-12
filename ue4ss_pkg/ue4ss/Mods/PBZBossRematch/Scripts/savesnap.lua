@@ -8,8 +8,7 @@ local SNAPSHOT_DIR = U.DataDir .. "/snapshot"
 local VETO_SOURCE = "PBZBossRematch"
 local VETO_REASON_MODE_GATE = 2
 local MAIN_SLOT = "PBZSaveGame"
-
-M.SaveDir = U.GameRoot .. "/ProjectPBZ/Saved/SaveGames/Steam/" .. Config.SteamId
+local SAVE_ROOT = U.GameRoot .. "/ProjectPBZ/Saved/SaveGames/Steam"
 
 local function saveSubsystem()
     return U.gameInstanceSubsystem("PBZSaveLoadSubsystem")
@@ -63,6 +62,44 @@ local function listFiles(dir)
     p:close()
     return names
 end
+
+local function listDirsNewestFirst(dir)
+    local ok, p = pcall(io.popen, 'dir /b /ad /o-d "' .. dir:gsub("/", "\\") .. '" 2>nul')
+    if not ok or not p then return nil end
+    local names = {}
+    for line in p:lines() do table.insert(names, line) end
+    p:close()
+    return names
+end
+
+local function dirWithMainSave(id)
+    if not id or id == "" then return nil end
+    local dir = SAVE_ROOT .. "/" .. id
+    if U.fileExists(dir .. "/" .. MAIN_SLOT .. ".sav") then return dir end
+    return nil
+end
+
+-- A wrong SteamId (the installer used to keep only the first digit) must not block the challenge.
+local function resolveSaveDir()
+    local configured = dirWithMainSave(Config.SteamId)
+    if configured then return configured end
+    local names = listDirsNewestFirst(SAVE_ROOT)
+    if names then
+        for _, name in ipairs(names) do
+            if name:match("^%d+$") then
+                local dir = dirWithMainSave(name)
+                if dir then
+                    U.log("SteamId %q has no %s.sav, using folder %s", Config.SteamId, MAIN_SLOT, name)
+                    return dir
+                end
+            end
+        end
+    end
+    return SAVE_ROOT .. "/" .. (Config.SteamId or "")
+end
+
+M.SaveDir = resolveSaveDir()
+U.log("save dir %s", M.SaveDir)
 
 local SAVE_NAME_PATTERN = "^%d%d%d%d%d%d%d%d%-%d%d%d%d%d%d%-%d+%.sav$"
 

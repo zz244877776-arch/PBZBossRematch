@@ -2,11 +2,11 @@
 import pathlib, re, shutil, zipfile
 
 WORK = pathlib.Path(__file__).resolve().parent
-GAME = WORK.parent
 UE4SS_ZIP = WORK / "downloads" / "phantombladezero_ue4ss_v3.0.1-1195-g1ceefac8.zip"
 MOD_SRC = WORK / "ue4ss_pkg" / "ue4ss" / "Mods" / "PBZBossRematch" / "Scripts"
 INSTALLER_SRC = WORK / "installer_src"
-DOC = GAME / "宿敌再战Mod_使用说明.md"
+DOC_SRC = WORK / "docs" / "使用说明.md"
+DOC_NAME = "宿敌再战Mod_使用说明.md"
 
 PKG_NAME = "宿敌再战Mod安装包"
 DIST = WORK / "dist"
@@ -69,10 +69,13 @@ def main():
     cfg = re.sub(r'(?m)^(\s*SteamId\s*=\s*)"[^"]*"', r'\1""', cfg)
     cfg_path.write_text(cfg, encoding="utf-8", newline="")
 
-    doc = DOC.read_text(encoding="utf-8")
-    doc = doc.split("\n---\n\n## 附录")[0].rstrip() + "\n"
-    (PAYLOAD / DOC.name).write_text(doc, encoding="utf-8")
-    (OUT / DOC.name).write_text(doc, encoding="utf-8")
+    doc = DOC_SRC.read_text(encoding="utf-8").replace("\r\n", "\n").replace("\r", "\n")
+    player, appendix, _rest = doc.partition("\n---\n\n## 附录")
+    if not appendix:
+        raise SystemExit("player doc is missing the appendix marker, package not built")
+    doc = player.rstrip() + "\n"
+    (PAYLOAD / DOC_NAME).write_text(doc, encoding="utf-8")
+    (OUT / DOC_NAME).write_text(doc, encoding="utf-8")
 
     inst = OUT / "installer"
     inst.mkdir()

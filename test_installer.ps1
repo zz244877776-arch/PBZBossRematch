@@ -76,4 +76,15 @@ Check 'other mod kept' ($mods3 -match 'OtherMod : 1')
 Check 'our mod added' ($mods3 -match 'PBZBossRematch : 1')
 Check 'manifest not by tool' ([IO.File]::ReadAllText("$fake\platform\steam\ue4ss\Mods\PBZBossRematch\install_manifest.txt") -match 'ue4ss_installed_by_tool=0')
 
+Write-Host "--- single save folder"
+$one = Join-Path $work 'test_game\One'
+New-Item -ItemType Directory -Force "$one\platform\steam", "$one\ProjectPBZ\Saved\SaveGames\Steam\76561198330139348" | Out-Null
+Set-Content "$one\platform\steam\PBZ.exe" 'x'
+Set-Content "$one\ProjectPBZ\Saved\SaveGames\Steam\76561198330139348\PBZSaveGame.sav" 'save'
+Install-Mod $one $true $false $log
+$oneCfg = [IO.File]::ReadAllText("$one\platform\steam\ue4ss\Mods\PBZBossRematch\Scripts\config.lua")
+Check 'single id not truncated' ($oneCfg -match 'SteamId = "76561198330139348"')
+$none = Get-SteamSaveIds (Join-Path $work 'test_game\Missing')
+Check 'no save folders' (($null -eq $none) -or ($none.Count -eq 0))
+
 Remove-Item (Join-Path $work 'test_game') -Recurse -Force
