@@ -307,6 +307,14 @@ local function allSpawners()
 end
 M.allSpawners = allSpawners
 
+function M.unresolvedSpawnerCount()
+    local n = 0
+    for _, s in ipairs(allSpawners()) do
+        if not M.spawnerClass(s) then n = n + 1 end
+    end
+    return n
+end
+
 local function sameClass(a, b)
     return a and b and string.lower(a) == string.lower(b)
 end
@@ -384,22 +392,35 @@ function M.learnArenas()
     local bosses = {}
     for _, b in ipairs(M.bosses()) do bosses[string.lower(b.class)] = b end
     local learned = 0
+    local candidates = {}
     for _, s in ipairs(allSpawners()) do
         local cls = M.spawnerClass(s)
         local b = cls and bosses[string.lower(cls)]
-        if b then
-            local loc = U.location(s)
-            if loc then
-                local bell = M.nearestBell(b.map, loc)
-                local prev = arenaCache[b.id]
-                if not prev or prev.unsupported or prev.bell ~= (bell and bell.id) then learned = learned + 1 end
-                arenaCache[b.id] = {
-                    map = b.map,
-                    x = math.floor(loc.X), y = math.floor(loc.Y), z = math.floor(loc.Z),
-                    bell = bell and bell.id or "",
-                    spawnerId = U.str(s.SpawnerID),
-                }
+        local loc = b and U.location(s)
+        if loc then
+            candidates[b.id] = candidates[b.id] or { boss = b, list = {} }
+            table.insert(candidates[b.id].list, { spawner = s, loc = loc })
+        end
+    end
+    -- A boss can have several spawners (story and rematch versions); keep the cached one if it is still among them.
+    for id, c in pairs(candidates) do
+        local prev = arenaCache[id]
+        local keep = false
+        if prev and not prev.unsupported and prev.x then
+            for _, cand in ipairs(c.list) do
+                if U.dist(cand.loc, { X = prev.x, Y = prev.y, Z = prev.z }) < 500 then keep = true end
             end
+        end
+        if not keep then
+            local b, s, loc = c.boss, c.list[1].spawner, c.list[1].loc
+            local bell = M.nearestBell(b.map, loc)
+            learned = learned + 1
+            arenaCache[b.id] = {
+                map = b.map,
+                x = math.floor(loc.X), y = math.floor(loc.Y), z = math.floor(loc.Z),
+                bell = bell and bell.id or "",
+                spawnerId = U.str(s.SpawnerID),
+            }
         end
     end
     if learned > 0 then

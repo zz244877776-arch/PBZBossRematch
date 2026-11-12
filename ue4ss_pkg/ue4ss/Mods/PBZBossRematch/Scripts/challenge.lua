@@ -19,7 +19,9 @@ local NEAR_BOSS_RADIUS = 3000
 local APPROACH_DISTANCE = 700
 local NEAR_BOSS_DISTANCES = { 700, 500, 1000, 1400 }
 local PLAYER_HEIGHT_OFFSET = 120
-local RELOAD_TIMEOUT_S = 90
+local RELOAD_TIMEOUT_S = 20
+local RELOAD_MIN_S = 5
+local SCAN_STABLE_REGIONS = 3
 
 -- idle -> traveling -> locating [-> scanning -> traveling -> locating] -> spawning -> fighting -> ending -> reloading -> idle
 local st = { phase = "idle" }
@@ -85,10 +87,13 @@ local function returnToStart(reason, delayMs)
         local state = Save.readState()
         local slot = (state and state.continueSlot) or Save.continueSlotName()
         st.reloadPawn = pawnAddress()
+        st.startBell = state and state.startBell
         setPhase("reloading")
+        -- The real save is back on disk at this point, so the state file must not survive:
+        -- recovery on a later launch would otherwise delete saves made after this challenge.
+        Save.clearState()
         if not Save.reloadSlot(slot) then
             Toast.show("读档失败：存档已恢复，请手动回到主菜单读档", 8000)
-            Save.clearState()
             setPhase("idle")
         end
     end)
@@ -282,6 +287,15 @@ local function tickScanning()
     if count ~= st.scanBaseSpawners then st.scanLoadedMore = true end
     U.log("region settled after %ds, %d spawners loaded (at arrival %d)", since, count, st.scanBaseSpawners or -1)
     Data.learnArenas()
+    -- When moving the streaming source loads nothing new, the whole map is already resident
+    -- and every spawner was checked, so the boss is simply not spawned by an AI spawner here.
+    local scanned = st.scanTotal - #st.scanQueue
+    if not st.scanLoadedMore and scanned >= SCAN_STABLE_REGIONS and Data.unresolvedSpawnerCount() == 0 then
+        Streaming.clear()
+        U.log("map fully loaded (%d spawners, all resolved), boss has no spawner here", count)
+        Data.markUnsupported(st.boss)
+        return abort(st.boss.name .. " 暂不支持再战（地图中没有它的刷怪点）")
+    end
     nextScanStep()
 end
 
@@ -344,14 +358,30 @@ local function finishReload()
     U.delay(4000, "challenge.backToast", function() Toast.show("已返回，进度未改变", 3000) end)
 end
 
+local function nearStartBell()
+    local bell = st.startBell and Data.bellById(st.startBell)
+    return bell and U.dist(U.location(U.playerPawn()), bell.loc) < ARRIVAL_RADIUS
+end
+
+-- Loading a slot inside the same world may keep the pawn at the same address and fire no
+-- map-load event, so arrival back at the start bell also counts as a finished reload.
 local function tickReloading()
     local addr = pawnAddress()
-    if addr and addr ~= st.reloadPawn and elapsed() > 2 then
+    if not addr then st.reloadPawnGone = true end
+    local reason = nil
+    if addr and addr ~= st.reloadPawn then reason = "new pawn"
+    elseif addr and st.reloadPawnGone then reason = "pawn back"
+    elseif addr and elapsed() >= RELOAD_MIN_S and nearStartBell() then reason = "at start bell"
+    end
+    if reason and elapsed() > 2 then
         st.reloadSeenAt = st.reloadSeenAt or os.time()
-        if os.time() - st.reloadSeenAt >= 3 then return finishReload() end
+        if os.time() - st.reloadSeenAt >= 3 then
+            U.log("reload detected: %s", reason)
+            return finishReload()
+        end
     end
     if elapsed() > RELOAD_TIMEOUT_S then
-        U.log("reload did not finish in time")
+        U.log("reload not detected within %ds, back to idle", RELOAD_TIMEOUT_S)
         Save.clearState()
         st = { phase = "idle" }
     end
@@ -434,7 +464,8 @@ function M.recoverIfNeeded()
         U.delay(15000, "challenge.recoverVeto", function() Save.exitVeto() end)
         if U.playerPawn() then
             U.log("in game during recovery; reloading slot")
-            st = { phase = "reloading", endReason = "recover", phaseAt = os.time(), reloadPawn = pawnAddress() }
+            st = { phase = "reloading", endReason = "recover", phaseAt = os.time(), reloadPawn = pawnAddress(),
+                   startBell = state.startBell }
             Save.reloadSlot(state.continueSlot or Save.continueSlotName())
         end
     else
