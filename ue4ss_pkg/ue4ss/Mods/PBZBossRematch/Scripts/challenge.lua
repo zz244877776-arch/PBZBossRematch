@@ -54,13 +54,55 @@ local function approachTransform(target, from, distance)
     }, math.deg(yaw)
 end
 
+local function inLevel(level)
+    return string.find(U.worldName() or "", level, 1, true) ~= nil
+end
+
+-- Fast travel while already in the destination level hangs the game, above all when the
+-- destination is the bell the player just opened. Move the pawn instead.
+local function localTeleport(transform)
+    local pawn = U.playerPawn()
+    if not U.valid(pawn) then return false, "找不到角色" end
+    local loc = transform.Translation
+    local here = U.location(pawn)
+    if here and U.dist(here, loc) < 150 then
+        U.log("already at the target")
+        return true
+    end
+    local q = transform.Rotation or {}
+    local yaw = math.deg(2 * math.atan(q.Z or 0, q.W or 1))
+    local rot = { Pitch = 0.0, Yaw = yaw, Roll = 0.0 }
+    local ok, moved = pcall(function() return pawn:K2_TeleportTo(loc, rot) end)
+    U.log("K2_TeleportTo ok=%s moved=%s", tostring(ok), tostring(moved))
+    if not (ok and moved) then return false, "同地图传送失败" end
+    pcall(function() U.playerController():SetControlRotation(rot) end)
+    return true
+end
+
 local function travel(level, transform, bellId)
+    st.travel = { level = level, loc = transform.Translation, bell = bellId }
+    local same = inLevel(level)
+    U.log("travel level=%s bell=%s sameMap=%s at (%.0f, %.0f, %.0f)", level, bellId, tostring(same),
+        transform.Translation.X, transform.Translation.Y, transform.Translation.Z)
+    if same then
+        local ok, err = localTeleport(transform)
+        if not ok then
+            U.log("local move failed: %s", tostring(err))
+            local here = U.location(U.playerPawn())
+            if here then st.travel.loc = here end
+            st.finalHop = false
+        end
+        st.arrivedAt = nil
+        setPhase("traveling")
+        return true
+    end
+    -- Cross-map travel has to land on the bell itself. A point in an unloaded cell hangs TeleportTo.
+    local bell = Data.bellById(bellId)
+    local xf = (bell and bell.transform) or transform
+    st.travel.loc = xf.Translation
     local sub = saveSub()
     if not sub then return false, "找不到存档子系统" end
-    st.travel = { level = level, loc = transform.Translation, bell = bellId }
-    U.log("TeleportTo level=%s bell=%s at (%.0f, %.0f, %.0f)", level, bellId,
-        transform.Translation.X, transform.Translation.Y, transform.Translation.Z)
-    local ok, err = pcall(function() sub:TeleportTo(FName(level), transform, FName(bellId)) end)
+    local ok, err = pcall(function() sub:TeleportTo(FName(level), xf, FName(bellId)) end)
     if not ok then return false, "传送失败: " .. tostring(err) end
     st.arrivedAt = nil
     setPhase("traveling")
@@ -158,7 +200,9 @@ function M.start(boss)
     Toast.show("宿敌再战：" .. boss.name, 3000)
 
     local transform = firstBell.transform
-    if arenaBell and arena.x then
+    -- Only step straight to the boss when this map is already loaded. Otherwise fast-travel
+    -- to its bell, and the later hop runs once that move is a same-map teleport.
+    if arenaBell and arena.x and inLevel(level) then
         local arenaLoc = { X = arena.x, Y = arena.y, Z = arena.z }
         transform = approachTransform(arenaLoc, arenaBell.loc, APPROACH_DISTANCE)
         st.finalHop = true
