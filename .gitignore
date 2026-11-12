@@ -1,0 +1,19 @@
+# Local-only data: save backups, downloads, build output, Python deps, probe dumps, crash dumps
+save_backup/
+downloads/
+dist/
+dump/
+probe/
+pytools/
+__pycache__/
+*.pyc
+
+# UE4SS runtime is third-party; only our own mods are tracked
+ue4ss_pkg/*
+!ue4ss_pkg/ue4ss/
+ue4ss_pkg/ue4ss/*
+!ue4ss_pkg/ue4ss/Mods/
+ue4ss_pkg/ue4ss/Mods/*
+!ue4ss_pkg/ue4ss/Mods/PBZBossRematch/
+!ue4ss_pkg/ue4ss/Mods/PBZBossProbe/
+ue4ss_pkg/ue4ss/Mods/*/data/
