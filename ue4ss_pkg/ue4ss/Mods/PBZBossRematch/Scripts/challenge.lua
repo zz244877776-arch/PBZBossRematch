@@ -244,8 +244,61 @@ local function trySequenceSpawn(spawner)
     return ok
 end
 
+local function spawnerLooksSequenced(spawner)
+    local id = ""
+    pcall(function() id = U.str(spawner.SpawnerID) end)
+    return id ~= "" and string.find(id, "Seq", 1, true) ~= nil
+end
+
+-- Multi-phase BGM is driven by the game's boss-fight music stage, which the arena sequence
+-- normally advances. Rematch skips that sequence, so push the stage ourselves.
+local function cheatManager()
+    local pc = U.playerController()
+    if not U.valid(pc) then return nil end
+    local ok, cm = pcall(function() return pc.CheatManager end)
+    if ok and U.valid(cm) then return cm end
+    local cmClass = StaticFindObject("/Script/ProjectPBZ.PBZCheatManager")
+    if U.valid(cmClass) then
+        local created = StaticConstructObject(cmClass, pc)
+        if U.valid(created) then
+            pcall(function() pc.CheatManager = created end)
+            return created
+        end
+    end
+    return FindFirstOf("PBZCheatManager")
+end
+
+local function setBossFightMusicStage(stage)
+    local audio = U.gameInstanceSubsystem("PBZPersistentAudioSubsystem")
+    if audio then
+        local ok, err = pcall(function() audio:SetBossFightMusicStageEnabled(true) end)
+        U.log("SetBossFightMusicStageEnabled(true) ok=%s %s", tostring(ok), ok and "" or tostring(err))
+    else
+        U.log("PBZPersistentAudioSubsystem not found")
+    end
+    local music = U.gameInstanceSubsystem("MusicSubsystem") or FindFirstOf("MusicSubsystem")
+    if music then
+        local ok, err = pcall(function() music:SetBossDeathStageEnabled(true) end)
+        U.log("SetBossDeathStageEnabled(true) ok=%s %s", tostring(ok), ok and "" or tostring(err))
+    end
+    local cm = cheatManager()
+    if not cm then
+        U.log("Gm_SetBossFightMusicStage skipped: no cheat manager")
+        return
+    end
+    local ok, err = pcall(function() cm:Gm_SetBossFightMusicStage(stage) end)
+    U.log("Gm_SetBossFightMusicStage(%s) ok=%s %s", tostring(stage), tostring(ok), ok and "" or tostring(err))
+    if not ok then
+        ok, err = pcall(function() cm:Gm_SetBossFightMusicStage(stage > 0) end)
+        U.log("Gm_SetBossFightMusicStage(bool) ok=%s %s", tostring(ok), ok and "" or tostring(err))
+    end
+end
+
 local function startSpawn(spawner)
     if not st.vetoed then st.vetoed = Save.enterVeto() end
+    -- A previous phase's death flag must not carry into this spawn, or the next tick "wins" immediately.
+    st.bossDied = false
+    st.playerDied = false
     st.spawner = spawner
     st.spawnerLoc = U.location(spawner)
     local hasAI = false
@@ -253,9 +306,17 @@ local function startSpawn(spawner)
     if not hasAI then
         pcall(function() spawner.ShouldSpawn = true end)
         pcall(function() spawner.SpawnerSaveInfo.IsAlive = true end)
-        local ok, err = pcall(function() spawner:Spawn() end)
-        U.log("Spawn() ok=%s %s", tostring(ok), ok and "" or tostring(err))
-        if not ok and not trySequenceSpawn(spawner) then return abort("刷出 Boss 失败") end
+        local spawned = false
+        if spawnerLooksSequenced(spawner) then
+            spawned = trySequenceSpawn(spawner)
+        end
+        if not spawned then
+            local ok, err = pcall(function() spawner:Spawn() end)
+            U.log("Spawn() ok=%s %s", tostring(ok), ok and "" or tostring(err))
+            spawned = ok
+            if not spawned then spawned = trySequenceSpawn(spawner) end
+        end
+        if not spawned then return abort("刷出 Boss 失败") end
     end
     st.altSpawnTried = false
     setPhase("spawning")
@@ -412,6 +473,9 @@ local function enterStage(stage, pawn)
     st.boss = stage
     st.bossPawn = pawn
     st.bossDied = false
+    st.playerDied = false
+    st.musicStage = (st.musicStage or 0) + 1
+    setBossFightMusicStage(st.musicStage)
     U.log("stage %s is up", stage.id)
     Toast.show("下一阶段：" .. stage.name, 3000)
     setPhase("fighting")
@@ -431,6 +495,9 @@ local function tickTransition()
     U.log("spawning next stage %s", stage.id)
     st.rootBoss = st.rootBoss or st.boss
     st.boss = stage
+    st.bossDied = false
+    st.musicStage = (st.musicStage or 0) + 1
+    setBossFightMusicStage(st.musicStage)
     startSpawn(spawner)
 end
 
@@ -442,6 +509,7 @@ local function tickFighting()
             st.rootBoss = st.rootBoss or st.boss
             st.nextStage = nextStage
             st.bossPawn = nil
+            st.bossDied = false
             return setPhase("transition")
         end
         return victory()
