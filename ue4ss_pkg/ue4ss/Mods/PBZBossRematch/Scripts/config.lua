@@ -13,8 +13,8 @@ return {
     EnableKillKey = true,
     KillKey = "END",
 
-    -- 胜利 / 失败后多久自动返回（毫秒）
-    VictoryReturnDelayMs = 5000,
+    -- 胜利 / 失败后多久自动返回（毫秒）。胜利稍长一点，留给「斩」字和死亡演出。
+    VictoryReturnDelayMs = 8000,
     DefeatReturnDelayMs = 7000,
 
     -- 不在列表中显示的图鉴条目（Lua 匹配模式，匹配图鉴行名）

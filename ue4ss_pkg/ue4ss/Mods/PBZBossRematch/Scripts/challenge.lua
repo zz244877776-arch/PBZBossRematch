@@ -180,6 +180,12 @@ function M.start(boss)
         Toast.show("找不到前往该地图的铃铛", 4000)
         return
     end
+    if arenaBell then
+        U.log("arena cache hit bell=%s at (%.0f, %.0f, %.0f)", arena.bell, arena.x or 0, arena.y or 0, arena.z or 0)
+    else
+        U.log("arena cache miss; first visit uses map bell %s (next time will be faster)", firstBell.id)
+        Toast.show("首次前往该地图，正在加载……", 3000)
+    end
     local level = Data.levelNameForBell(firstBell.id)
     if not level then
         Toast.show("找不到铃铛所在关卡", 4000)
@@ -235,19 +241,98 @@ local function tickTraveling()
 end
 
 -- Spawners placed for cutscenes ignore Spawn() and only react to the sequence entry points.
+-- ClaimSeqSpawn first: it is what ties the spawner back into the Level Sequence / Flow Graph
+-- that also brings minions, formations, death banners ("斩"), and phase music.
 local function trySequenceSpawn(spawner)
-    local ok = pcall(function() spawner:SpawnFromSequence() end)
-    U.log("SpawnFromSequence() ok=%s", tostring(ok))
-    if ok then return true end
-    ok = pcall(function() spawner:ClaimSeqSpawn(false, true, true) end)
-    U.log("ClaimSeqSpawn() ok=%s", tostring(ok))
-    return ok
+    local okClaim = pcall(function() spawner:ClaimSeqSpawn(false, true, true) end)
+    U.log("ClaimSeqSpawn() ok=%s", tostring(okClaim))
+    local okSeq = pcall(function() spawner:SpawnFromSequence() end)
+    U.log("SpawnFromSequence() ok=%s", tostring(okSeq))
+    return okClaim or okSeq
+end
+
+local function spawnerId(spawner)
+    local id = ""
+    pcall(function() id = U.str(spawner.SpawnerID) end)
+    return id or ""
 end
 
 local function spawnerLooksSequenced(spawner)
-    local id = ""
-    pcall(function() id = U.str(spawner.SpawnerID) end)
-    return id ~= "" and string.find(id, "Seq", 1, true) ~= nil
+    return string.find(spawnerId(spawner), "Seq", 1, true) ~= nil
+end
+
+-- "Jianou_Seq076" / "LionDanceBattle_Seq062" -> family prefix used by the same encounter.
+local function encounterPrefix(id)
+    if not id or id == "" or id == "None" then return nil end
+    local prefix = string.match(id, "^([%w]+)_Seq") or string.match(id, "^([%w_]-)_Seq")
+    return prefix
+end
+
+-- Boss-only Spawn() skips the encounter's party / formation actors. Pull those in too.
+local function activateEncounterSupport(center, mainSpawner)
+    if not center then return end
+    local mainId = spawnerId(mainSpawner)
+    local prefix = encounterPrefix(mainId)
+    local activated = 0
+
+    if prefix then
+        for _, s in ipairs(Data.allSpawners()) do
+            if s ~= mainSpawner and U.valid(s) then
+                local sid = spawnerId(s)
+                if sid ~= "" and string.find(sid, prefix, 1, true) == 1 then
+                    local loc = U.location(s)
+                    if loc and U.dist(loc, center) <= 12000 then
+                        pcall(function() s.ShouldSpawn = true end)
+                        pcall(function() s.SpawnerSaveInfo.IsAlive = true end)
+                        if not trySequenceSpawn(s) then
+                            pcall(function() s:Spawn() end)
+                        end
+                        activated = activated + 1
+                        U.log("encounter support spawner %s", sid)
+                    end
+                end
+            end
+        end
+    end
+
+    for _, party in ipairs(FindAllOf("PBZMonsterPartySpawner") or {}) do
+        if U.valid(party) then
+            local loc = U.location(party)
+            if loc and U.dist(loc, center) <= 12000 then
+                local ok = false
+                for _, name in ipairs({ "ActivateMonsterParty", "ActivateParty", "Spawn" }) do
+                    local called = pcall(function() party[name](party) end)
+                    if called then
+                        ok = true
+                        U.log("party %s via %s", U.str(party.PartyID), name)
+                        break
+                    end
+                end
+                if ok then activated = activated + 1 end
+            end
+        end
+    end
+
+    for _, seq in ipairs(FindAllOf("LevelSequenceActor") or {}) do
+        if U.valid(seq) then
+            local loc = U.location(seq)
+            if loc and U.dist(loc, center) <= 12000 then
+                local played = pcall(function() seq:Play() end)
+                if not played then
+                    played = pcall(function()
+                        local player = seq.SequencePlayer
+                        if player then player:Play() end
+                    end)
+                end
+                if played then
+                    activated = activated + 1
+                    U.log("played LevelSequenceActor %s", U.fullName(seq))
+                end
+            end
+        end
+    end
+
+    U.log("encounter support activated=%d prefix=%s", activated, tostring(prefix))
 end
 
 -- Multi-phase BGM is driven by the game's boss-fight music stage, which the arena sequence
@@ -318,6 +403,7 @@ local function startSpawn(spawner)
         end
         if not spawned then return abort("刷出 Boss 失败") end
     end
+    activateEncounterSupport(st.spawnerLoc, spawner)
     st.altSpawnTried = false
     setPhase("spawning")
 end
@@ -344,14 +430,34 @@ local function spawnerCount()
     return #Data.allSpawners()
 end
 
+local function hopToCachedArena()
+    local arena = Data.arena(st.boss.id)
+    if not arena or arena.unsupported or not arena.x then return false end
+    local arenaLoc = { X = arena.x, Y = arena.y, Z = arena.z }
+    local pawnLoc = U.location(U.playerPawn())
+    if not pawnLoc then return false end
+    if U.dist(pawnLoc, arenaLoc) <= NEAR_BOSS_RADIUS then
+        st.finalHop = true
+        return false
+    end
+    local bell = (arena.bell ~= "" and Data.bellById(arena.bell)) or Data.nearestBell(st.boss.map, arenaLoc)
+    local transform = approachTransform(arenaLoc, (bell and bell.loc) or pawnLoc, APPROACH_DISTANCE)
+    st.finalHop = true
+    U.log("cached arena %.0f away, jumping next to it", U.dist(pawnLoc, arenaLoc))
+    local ok, err = travel(st.level, transform, bell and bell.id or st.travel.bell)
+    if not ok then abort(err) end
+    return true
+end
+
 -- Objects in regions that are still loading or unloading must not be touched, so every
 -- spawner lookup waits until the engine reports that streaming has settled.
 local function tickLocating()
     local settled = elapsed() >= SCAN_SETTLE_S and Streaming.idle()
     if not settled and elapsed() < LOCATE_TIMEOUT_S then return end
+    -- Known boss spot: one short hop next to it, instead of scanning every bell on the map.
+    if not st.finalHop and hopToCachedArena() then return end
     local spawner = Data.findSpawner(st.boss.class)
     if spawner then return onSpawnerFound(spawner) end
-    Data.dumpSpawners(st.boss.map)
     Streaming.clear()
     st.scanQueue = {}
     for _, b in ipairs(st.mapBells) do
