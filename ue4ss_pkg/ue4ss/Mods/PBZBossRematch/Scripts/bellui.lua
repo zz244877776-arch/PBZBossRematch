@@ -255,6 +255,13 @@ local function inject(m)
     U.log("bell menu: entry button injected")
 end
 
+function M.menuOpen()
+    for _, m in ipairs(FindAllOf("W_BellMenu_C") or {}) do
+        if U.valid(m) and isActivated(m) then return true end
+    end
+    return false
+end
+
 function M.tick(enabled)
     if not enabled then return end
     if U.valid(menu) and not isActivated(menu) and #hiddenChildren > 0 then

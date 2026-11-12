@@ -95,7 +95,15 @@ local function returnToStart(reason, delayMs)
         if not Save.reloadSlot(slot) then
             Toast.show("读档失败：存档已恢复，请手动回到主菜单读档", 8000)
             setPhase("idle")
+            return
         end
+        local reloadAt = st.phaseAt
+        U.delay((RELOAD_TIMEOUT_S + 2) * 1000, "challenge.reloadFallback", function()
+            if st.phase == "reloading" and st.phaseAt == reloadAt then
+                U.log("reload fallback timer fired, back to idle")
+                st = { phase = "idle" }
+            end
+        end)
     end)
 end
 
@@ -368,6 +376,11 @@ end
 local function tickReloading()
     local addr = pawnAddress()
     if not addr then st.reloadPawnGone = true end
+    if os.time() - (st.reloadLogAt or 0) >= 3 then
+        st.reloadLogAt = os.time()
+        U.log("reloading %ds: pawn=%s (before %s) gone=%s nearStart=%s", elapsed(), tostring(addr),
+            tostring(st.reloadPawn), tostring(st.reloadPawnGone == true), tostring(nearStartBell() == true))
+    end
     local reason = nil
     if addr and addr ~= st.reloadPawn then reason = "new pawn"
     elseif addr and st.reloadPawnGone then reason = "pawn back"
@@ -385,6 +398,13 @@ local function tickReloading()
         Save.clearState()
         st = { phase = "idle" }
     end
+end
+
+-- Opening a bell menu means the player is back in control, which ends any pending reload.
+function M.onBellMenuOpen()
+    if st.phase ~= "reloading" then return end
+    U.log("reload detected: bell menu opened")
+    finishReload()
 end
 
 function M.tick()

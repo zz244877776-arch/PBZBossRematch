@@ -37,6 +37,7 @@ end
 
 LoopAsync(TICK_MS, function()
     U.gameThread("tick", function()
+        if Challenge.phase() == "reloading" and BellUI.menuOpen() then Challenge.onBellMenuOpen() end
         BellUI.tick(not Challenge.isActive())
         tickChallenge()
         if not Challenge.isActive() and os.time() - lastLearnAt >= LEARN_INTERVAL_S and U.playerPawn() and Streaming.idle() then
