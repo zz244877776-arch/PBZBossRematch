@@ -4,6 +4,7 @@ local Data = require("gamedata")
 local Save = require("savesnap")
 local Toast = require("toast")
 local Streaming = require("streaming")
+local Curtain = require("curtain")
 
 local M = {}
 
@@ -23,8 +24,14 @@ local RELOAD_TIMEOUT_S = 20
 local RELOAD_MIN_S = 5
 local SCAN_STABLE_REGIONS = 3
 local STAGE_WAIT_S = 6
+local STAGE_FADE_AT_S = 4
+local STAGE_FADE_S = 1.0
+local PREPARE_MIN_S = 2
+local PREPARE_TIMEOUT_S = 15
+local REVEAL_FADE_S = 0.8
 
--- idle -> traveling -> locating [-> scanning -> traveling -> locating] -> spawning -> fighting -> ending -> reloading -> idle
+-- idle -> traveling -> locating [-> scanning -> traveling -> locating] -> spawning -> preparing -> countdown
+--   -> fighting -> ending -> reloading -> idle
 local st = { phase = "idle" }
 
 function M.phase() return st.phase end
@@ -119,10 +126,84 @@ local function pawnAddress()
     return pawn and U.address(pawn) or nil
 end
 
+local function controllerOf(pawn)
+    local ok, c = pcall(function() return pawn.Controller end)
+    return ok and U.valid(c) and c or nil
+end
+
+local function sgameAIComponents(pawn, controller)
+    local cls = StaticFindObject("/Script/SGameAI.SGameAIComponent")
+    local list = {}
+    if not U.valid(cls) then return list end
+    for _, owner in ipairs({ pawn, controller }) do
+        if U.valid(owner) then
+            local ok, comp = pcall(function() return owner:GetComponentByClass(cls) end)
+            if ok and U.valid(comp) then table.insert(list, comp) end
+        end
+    end
+    return list
+end
+
+local function call(what, fn)
+    local ok, err = pcall(fn)
+    U.log("%s ok=%s %s", what, tostring(ok), ok and "" or tostring(err))
+end
+
+-- The game's own hit-stop keeps rewriting time dilation, so the boss is also stopped through
+-- its character freeze, the SGameAI component and the behavior tree. The AI controller can be
+-- possessed a moment after spawning, so the controller-side calls repeat when it changes.
+local function setFrozen(pawn, frozen)
+    if not U.valid(pawn) then return end
+    local d = frozen and 0.0 or 1.0
+    pcall(function() pawn.CustomTimeDilation = d end)
+    local controller = controllerOf(pawn)
+    if controller then pcall(function() controller.CustomTimeDilation = d end) end
+    local key = tostring(U.address(pawn)) .. "/" .. tostring(controller and U.address(controller))
+    if frozen and st.freezeKey == key then return end
+    st.freezeKey = frozen and key or nil
+    local verb = frozen and "freeze" or "release"
+    call(verb .. " FreezeCharacter", function() pawn:FreezeCharacter(frozen) end)
+    for _, comp in ipairs(sgameAIComponents(pawn, controller)) do
+        if frozen then
+            call(verb .. " StopAI", function() comp:StopAI() end)
+        else
+            call(verb .. " StartAI", function() comp:StartAI() end)
+        end
+    end
+    if controller then
+        local lib = StaticFindObject("/Script/SGameAI.Default__SGameAIFunctionLibrary")
+        local brain = nil
+        pcall(function() brain = controller.BrainComponent end)
+        if U.valid(lib) and U.valid(brain) then
+            if frozen then
+                call(verb .. " PauseLogic", function() lib:PauseLogic(brain, "PBZBossRematch") end)
+            else
+                call(verb .. " ResumeLogic", function() lib:ResumeLogic(brain, "PBZBossRematch") end)
+            end
+        end
+        local perception = nil
+        pcall(function() perception = controller.PerceptionComponent end)
+        if U.valid(lib) and U.valid(perception) then
+            call(verb .. " SetSensesEnabled", function() lib:SetSensesEnabled(perception, not frozen) end)
+        end
+        call(verb .. " StopMovement", function() controller:StopMovement() end)
+    end
+end
+
+local function unfreezeBoss()
+    if st.frozenPawn then
+        setFrozen(st.frozenPawn, false)
+        U.log("boss released")
+        st.frozenPawn = nil
+    end
+end
+
 local function returnToStart(reason, delayMs)
     if st.phase == "ending" or st.phase == "reloading" then return end
     st.endReason = reason
     setPhase("ending")
+    unfreezeBoss()
+    Curtain.reveal(0.3)
     Streaming.clear()
     U.delay(delayMs or 0, "challenge.return", function()
         Save.exitVeto()
@@ -204,6 +285,7 @@ function M.start(boss)
 
     st = { phase = "idle", boss = boss, level = level, mapBells = mapBells }
     Toast.show("宿敌再战：" .. boss.name, 3000)
+    if Config.LoadingCurtain ~= false then Curtain.cover() end
 
     local transform = firstBell.transform
     -- Only step straight to the boss when this map is already loaded. Otherwise fast-travel
@@ -216,6 +298,7 @@ function M.start(boss)
 
     local tok, terr = travel(level, transform, firstBell.id)
     if not tok then
+        Curtain.reveal(0.3)
         Save.clearState()
         st = { phase = "idle" }
         Toast.show(terr, 5000)
@@ -549,8 +632,14 @@ local function tickSpawning()
     if U.valid(ai) and not isDead(ai) then
         st.bossPawn = ai
         placePlayerNearBoss()
-        setPhase("fighting")
-        Toast.show((st.rootBoss and "下一阶段：" or "挑战开始：") .. st.boss.name, 3000)
+        if st.rootBoss and not Curtain.isCovered() then
+            setPhase("fighting")
+            Toast.show("下一阶段：" .. st.boss.name, 3000)
+            return
+        end
+        st.frozenPawn = ai
+        setFrozen(ai, true)
+        setPhase("preparing")
         return
     end
     if not st.altSpawnTried and elapsed() > ALT_SPAWN_AFTER_S then
@@ -560,6 +649,46 @@ local function tickSpawning()
     if elapsed() > SPAWN_TIMEOUT_S then
         abort(st.rootBoss and (st.boss.name .. " 没有出现，挑战结束") or "Boss 没有出现")
     end
+end
+
+local function beginFight()
+    unfreezeBoss()
+    setPhase("fighting")
+    Toast.show("开战：" .. st.boss.name, 2000)
+end
+
+-- Numbers are driven by timers rather than the 300 ms tick so each one lasts a full second.
+local function startCountdown()
+    local seconds = math.floor(tonumber(Config.CountdownSeconds) or 3)
+    setPhase("countdown")
+    if seconds <= 0 then return beginFight() end
+    local id = os.time() .. "-" .. tostring(math.random(1, 1e6))
+    st.countdownId = id
+    for i = 0, seconds do
+        U.delay(i * 1000, "challenge.countdown", function()
+            if st.phase ~= "countdown" or st.countdownId ~= id then return end
+            if i < seconds then
+                Toast.show(string.format("准备迎战 %s  %d", st.boss.name, seconds - i), 1100)
+            else
+                beginFight()
+            end
+        end)
+    end
+end
+
+-- The boss stays frozen behind the black screen until the world around it has finished streaming in.
+local function tickPreparing()
+    setFrozen(st.bossPawn, true)
+    if not U.valid(st.bossPawn) then return abort("Boss 加载失败") end
+    local ready = elapsed() >= PREPARE_MIN_S and Streaming.idle()
+    if not ready and elapsed() < PREPARE_TIMEOUT_S then return end
+    U.log("arena ready after %ds (streaming idle=%s)", elapsed(), tostring(Streaming.idle()))
+    Curtain.reveal(REVEAL_FADE_S)
+    startCountdown()
+end
+
+local function tickCountdown()
+    setFrozen(st.bossPawn, true)
 end
 
 local function victory()
@@ -576,6 +705,7 @@ local function livePawnOf(boss)
 end
 
 local function enterStage(stage, pawn)
+    Curtain.reveal(REVEAL_FADE_S)
     st.boss = stage
     st.bossPawn = pawn
     st.bossDied = false
@@ -588,11 +718,19 @@ local function enterStage(stage, pawn)
 end
 
 -- After a phase dies the game may run its own transition; give it a moment, then spawn the next phase ourselves.
+-- The death performance plays out first, then the screen fades to black so the old body is never
+-- seen next to the new phase.
 local function tickTransition()
     local stage = st.nextStage
     local pawn = livePawnOf(stage)
     if pawn then return enterStage(stage, pawn) end
+    if elapsed() >= STAGE_FADE_AT_S and Config.LoadingCurtain ~= false then Curtain.fadeOut(STAGE_FADE_S) end
     if elapsed() < STAGE_WAIT_S then return end
+    if U.valid(st.deadStagePawn) then
+        pcall(function() st.deadStagePawn:SetActorHiddenInGame(true) end)
+        U.log("previous stage body hidden")
+    end
+    st.deadStagePawn = nil
     local spawner = Data.findSpawner(stage.class)
     if not spawner then
         U.log("no spawner for %s, finishing after %s", stage.id, st.boss.id)
@@ -614,6 +752,7 @@ local function tickFighting()
             U.log("%s down, waiting for %s", st.boss.id, nextStage.id)
             st.rootBoss = st.rootBoss or st.boss
             st.nextStage = nextStage
+            st.deadStagePawn = st.bossPawn
             st.bossPawn = nil
             st.bossDied = false
             return setPhase("transition")
@@ -675,11 +814,14 @@ function M.onBellMenuOpen()
 end
 
 function M.tick()
+    Curtain.hold()
     local p = st.phase
     if p == "traveling" then tickTraveling()
     elseif p == "locating" then tickLocating()
     elseif p == "scanning" then tickScanning()
     elseif p == "spawning" then tickSpawning()
+    elseif p == "preparing" then tickPreparing()
+    elseif p == "countdown" then tickCountdown()
     elseif p == "fighting" then tickFighting()
     elseif p == "transition" then tickTransition()
     elseif p == "reloading" then tickReloading()
@@ -696,7 +838,8 @@ end
 
 function M.onPlayerDeadWidget()
     local p = st.phase
-    if p == "fighting" or p == "transition" or p == "spawning" or p == "locating" or p == "scanning" or p == "traveling" then
+    if p == "fighting" or p == "transition" or p == "spawning" or p == "preparing" or p == "countdown"
+        or p == "locating" or p == "scanning" or p == "traveling" then
         U.log("player died")
         st.playerDied = true
         if p ~= "fighting" then returnToStart("defeat", Config.DefeatReturnDelayMs) end
@@ -704,6 +847,7 @@ function M.onPlayerDeadWidget()
 end
 
 function M.onMapLoaded()
+    Curtain.hold()
     if st.phase == "reloading" then
         U.log("map loaded while reloading")
     end

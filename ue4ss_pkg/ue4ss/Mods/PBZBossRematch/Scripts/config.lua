@@ -17,6 +17,12 @@ return {
     VictoryReturnDelayMs = 8000,
     DefeatReturnDelayMs = 7000,
 
+    -- 前往 Boss 时先黑屏，等场景和 Boss 加载完成后再显示画面
+    LoadingCurtain = true,
+
+    -- 画面出现后 Boss 定格的倒计时秒数（0 = 不倒计时）
+    CountdownSeconds = 3,
+
     -- 不在列表中显示的图鉴条目（Lua 匹配模式，匹配图鉴行名）
     -- 多阶段 Boss 的后续阶段由第一阶段自动转入，不能单独挑战
     HiddenBossPatterns = { "_P2$", "Variants$", "_Tutorial$" },

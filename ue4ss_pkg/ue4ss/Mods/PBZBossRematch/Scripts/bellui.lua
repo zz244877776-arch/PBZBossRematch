@@ -7,6 +7,13 @@ local M = {}
 
 local VIS_VISIBLE = 0
 local VIS_COLLAPSED = 1
+local VIS_HIDDEN = 2
+local NAV_UP = 2
+local NAV_DOWN = 3
+
+-- Per-instance settings the menu designer filled in on the original buttons; new buttons start empty.
+local COPIED_BUTTON_FIELDS = { "ClickSound", "OnHoverSound", "bCanPlaySound" }
+local TEMPLATE_BUTTON_FIELDS = { "ShopButton", "ManualSave", "AbilityCultivation", "CloseBtn" }
 
 M.OnBossChosen = nil
 
@@ -48,11 +55,37 @@ local function setLabel(btn, text)
     loggedLabel = true
 end
 
+local loggedCopy = false
+
+local function copyButtonSettings(btn)
+    local template = nil
+    for _, field in ipairs(TEMPLATE_BUTTON_FIELDS) do
+        local ok, w = pcall(function() return menu[field] end)
+        if ok and U.valid(w) then
+            template = w
+            break
+        end
+    end
+    if not template then return end
+    for _, field in ipairs(COPIED_BUTTON_FIELDS) do
+        local ok, err = pcall(function() btn[field] = template[field] end)
+        if not loggedCopy then
+            local back = nil
+            pcall(function() back = btn[field] end)
+            U.log("button setting %s ok=%s now=%s %s", field, tostring(ok),
+                tostring(back ~= nil and (type(back) == "boolean" and tostring(back) or U.fullName(back)) or nil),
+                ok and "" or tostring(err))
+        end
+    end
+    loggedCopy = true
+end
+
 local function newButton(label, action)
     local pc = U.playerController()
     local wbl = StaticFindObject("/Script/UMG.Default__WidgetBlueprintLibrary")
     local btn = wbl:Create(menu, Toast.ButtonClass, pc)
     if not U.valid(btn) then return nil end
+    copyButtonSettings(btn)
     buttonActions[U.address(btn)] = action
     return btn
 end
@@ -76,6 +109,45 @@ local function childrenOf(box)
         if ok and U.valid(c) then table.insert(list, c) end
     end
     return list
+end
+
+local function isShown(w)
+    local ok, vis = pcall(function() return w:GetVisibility() end)
+    return ok and vis ~= VIS_COLLAPSED and vis ~= VIS_HIDDEN
+end
+
+-- Some menu entries sit inside a border or overlay; dig out the button itself.
+local function buttonIn(w, depth)
+    if not U.valid(w) or not isShown(w) then return nil end
+    if U.className(w) == "W_DialogueButton_C" then return w end
+    if (depth or 0) >= 2 then return nil end
+    local ok, content = pcall(function() return w:GetContent() end)
+    if ok and U.valid(content) then return buttonIn(content, (depth or 0) + 1) end
+    for _, c in ipairs(childrenOf(w)) do
+        local b = buttonIn(c, (depth or 0) + 1)
+        if b then return b end
+    end
+    return nil
+end
+
+-- The designer wired explicit up/down links between the original buttons, so gamepad focus
+-- jumps over anything inserted later. Re-chain every visible button, wrapping at both ends.
+local function relinkNavigation()
+    if not U.valid(menu) then return end
+    local buttons = {}
+    for _, c in ipairs(childrenOf(menu.MainBox)) do
+        local b = buttonIn(c)
+        if b then table.insert(buttons, b) end
+    end
+    local n = #buttons
+    if n == 0 then return end
+    for i, b in ipairs(buttons) do
+        local up = buttons[i > 1 and i - 1 or n]
+        local down = buttons[i < n and i + 1 or 1]
+        pcall(function() b:SetNavigationRuleExplicit(NAV_UP, up) end)
+        pcall(function() b:SetNavigationRuleExplicit(NAV_DOWN, down) end)
+    end
+    U.log("bell menu: navigation linked over %d buttons", n)
 end
 
 local function clearList()
@@ -160,6 +232,7 @@ local function buildList(entries)
     end
     U.delay(50, "bellui.labels", function()
         applyLabels()
+        relinkNavigation()
         focus(buttons[1])
     end)
     U.delay(400, "bellui.labels2", applyLabels)
@@ -170,6 +243,7 @@ local showMapList
 local function backToMenu()
     clearList()
     showOriginals()
+    relinkNavigation()
     focus(entryButton)
 end
 
@@ -250,8 +324,15 @@ local function inject(m)
     end
     addToMainBox(entryButton)
     local entry = entryButton
-    U.delay(50, "bellui.entryLabel", function() if U.valid(entry) then setLabel(entry, Config.EntryLabel) end end)
-    U.delay(400, "bellui.entryLabel2", function() if U.valid(entry) then setLabel(entry, Config.EntryLabel) end end)
+    U.delay(50, "bellui.entryLabel", function()
+        if U.valid(entry) then setLabel(entry, Config.EntryLabel) end
+        relinkNavigation()
+    end)
+    -- The menu shows or hides some of its own entries while it animates in.
+    U.delay(400, "bellui.entryLabel2", function()
+        if U.valid(entry) then setLabel(entry, Config.EntryLabel) end
+        relinkNavigation()
+    end)
     U.log("bell menu: entry button injected")
 end
 
