@@ -116,6 +116,21 @@ local function travel(level, transform, bellId)
     return true
 end
 
+-- Actors are remembered by address and class only, then looked up among live objects each time:
+-- a corpse or spawner the engine has already freed must never be touched through an old wrapper.
+local function remember(actor)
+    if not actor then return nil, nil end
+    return U.address(actor), U.className(actor)
+end
+
+local function bossPawn()
+    return U.live(st.bossClass, st.bossKey)
+end
+
+local function setBoss(pawn)
+    st.bossKey, st.bossClass = remember(pawn)
+end
+
 local function isDead(actor)
     local ok, v = pcall(function() return actor:IsDead() end)
     return ok and v == true
@@ -191,10 +206,11 @@ local function setFrozen(pawn, frozen)
 end
 
 local function unfreezeBoss()
-    if st.frozenPawn then
-        setFrozen(st.frozenPawn, false)
+    if st.frozenKey then
+        local p = U.live(st.frozenClass, st.frozenKey)
+        if p then setFrozen(p, false) end
         U.log("boss released")
-        st.frozenPawn = nil
+        st.frozenKey, st.frozenClass = nil, nil
     end
 end
 
@@ -467,7 +483,7 @@ local function startSpawn(spawner)
     -- A previous phase's death flag must not carry into this spawn, or the next tick "wins" immediately.
     st.bossDied = false
     st.playerDied = false
-    st.spawner = spawner
+    st.spawnerKey, st.spawnerClass = remember(spawner)
     st.spawnerLoc = U.location(spawner)
     local hasAI = false
     pcall(function() hasAI = U.valid(spawner.SpawnedAI) and not isDead(spawner.SpawnedAI) end)
@@ -609,7 +625,7 @@ end
 
 local function placePlayerNearBoss()
     local pawn = U.playerPawn()
-    local bossLoc = st.spawnerLoc or U.location(st.bossPawn)
+    local bossLoc = st.spawnerLoc or U.location(bossPawn())
     local p = U.location(pawn)
     if not pawn or not bossLoc or not p then return end
     if U.dist(p, bossLoc) <= NEAR_BOSS_DISTANCES[#NEAR_BOSS_DISTANCES] then return end
@@ -627,24 +643,25 @@ local function placePlayerNearBoss()
 end
 
 local function tickSpawning()
+    local spawner = U.live(st.spawnerClass, st.spawnerKey)
     local ai = nil
-    pcall(function() ai = st.spawner.SpawnedAI end)
+    if spawner then pcall(function() ai = spawner.SpawnedAI end) end
     if U.valid(ai) and not isDead(ai) then
-        st.bossPawn = ai
+        setBoss(ai)
         placePlayerNearBoss()
         if st.rootBoss and not Curtain.isCovered() then
             setPhase("fighting")
             Toast.show("下一阶段：" .. st.boss.name, 3000)
             return
         end
-        st.frozenPawn = ai
+        st.frozenKey, st.frozenClass = st.bossKey, st.bossClass
         setFrozen(ai, true)
         setPhase("preparing")
         return
     end
-    if not st.altSpawnTried and elapsed() > ALT_SPAWN_AFTER_S then
+    if not st.altSpawnTried and elapsed() > ALT_SPAWN_AFTER_S and spawner then
         st.altSpawnTried = true
-        trySequenceSpawn(st.spawner)
+        trySequenceSpawn(spawner)
     end
     if elapsed() > SPAWN_TIMEOUT_S then
         abort(st.rootBoss and (st.boss.name .. " 没有出现，挑战结束") or "Boss 没有出现")
@@ -678,8 +695,9 @@ end
 
 -- The boss stays frozen behind the black screen until the world around it has finished streaming in.
 local function tickPreparing()
-    setFrozen(st.bossPawn, true)
-    if not U.valid(st.bossPawn) then return abort("Boss 加载失败") end
+    local boss = bossPawn()
+    if not boss then return abort("Boss 加载失败") end
+    setFrozen(boss, true)
     local ready = elapsed() >= PREPARE_MIN_S and Streaming.idle()
     if not ready and elapsed() < PREPARE_TIMEOUT_S then return end
     U.log("arena ready after %ds (streaming idle=%s)", elapsed(), tostring(Streaming.idle()))
@@ -688,7 +706,8 @@ local function tickPreparing()
 end
 
 local function tickCountdown()
-    setFrozen(st.bossPawn, true)
+    local boss = bossPawn()
+    if boss then setFrozen(boss, true) end
 end
 
 local function victory()
@@ -707,7 +726,7 @@ end
 local function enterStage(stage, pawn)
     Curtain.reveal(REVEAL_FADE_S)
     st.boss = stage
-    st.bossPawn = pawn
+    setBoss(pawn)
     st.bossDied = false
     st.playerDied = false
     st.musicStage = (st.musicStage or 0) + 1
@@ -726,11 +745,12 @@ local function tickTransition()
     if pawn then return enterStage(stage, pawn) end
     if elapsed() >= STAGE_FADE_AT_S and Config.LoadingCurtain ~= false then Curtain.fadeOut(STAGE_FADE_S) end
     if elapsed() < STAGE_WAIT_S then return end
-    if U.valid(st.deadStagePawn) then
-        pcall(function() st.deadStagePawn:SetActorHiddenInGame(true) end)
+    local body = U.live(st.deadClass, st.deadKey)
+    if body then
+        pcall(function() body:SetActorHiddenInGame(true) end)
         U.log("previous stage body hidden")
     end
-    st.deadStagePawn = nil
+    st.deadKey, st.deadClass = nil, nil
     local spawner = Data.findSpawner(stage.class)
     if not spawner then
         U.log("no spawner for %s, finishing after %s", stage.id, st.boss.id)
@@ -746,14 +766,15 @@ local function tickTransition()
 end
 
 local function tickFighting()
-    if st.bossDied or not U.valid(st.bossPawn) or isDead(st.bossPawn) then
+    local boss = bossPawn()
+    if st.bossDied or not boss or isDead(boss) then
         local nextStage = Data.nextStage(st.boss)
         if nextStage then
             U.log("%s down, waiting for %s", st.boss.id, nextStage.id)
             st.rootBoss = st.rootBoss or st.boss
             st.nextStage = nextStage
-            st.deadStagePawn = st.bossPawn
-            st.bossPawn = nil
+            st.deadKey, st.deadClass = st.bossKey, st.bossClass
+            st.bossKey, st.bossClass = nil, nil
             st.bossDied = false
             return setPhase("transition")
         end
@@ -830,7 +851,7 @@ end
 
 function M.onEnemyDied(character)
     if st.phase ~= "fighting" then return end
-    if U.address(character) == U.address(st.bossPawn) then
+    if st.bossKey and U.address(character) == st.bossKey then
         U.log("boss died")
         st.bossDied = true
     end
@@ -869,14 +890,15 @@ function M.quit()
 end
 
 function M.killBoss()
-    if st.phase ~= "fighting" or not U.valid(st.bossPawn) then return end
+    local boss = bossPawn()
+    if st.phase ~= "fighting" or not boss then return end
     local geKill = FindObject("BlueprintGeneratedClass", "GE_Kill_C")
     local asl = StaticFindObject("/Script/GameplayAbilities.Default__AbilitySystemBlueprintLibrary")
     if not U.valid(geKill) or not U.valid(asl) then
         U.log("kill: GE_Kill_C or AbilitySystemBlueprintLibrary missing")
         return
     end
-    local target = asl:GetAbilitySystemComponent(st.bossPawn)
+    local target = asl:GetAbilitySystemComponent(boss)
     local source = asl:GetAbilitySystemComponent(U.playerPawn())
     local ok, err = pcall(function()
         source:BP_ApplyGameplayEffectToTarget(geKill, target, 1.0, source:MakeEffectContext())

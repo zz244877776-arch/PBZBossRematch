@@ -8,7 +8,6 @@ local BLACK = { R = 0.0, G = 0.0, B = 0.0, A = 1.0 }
 
 -- nil = no curtain, "fading" = animating to black, "covered" = held black
 local state = nil
-local ownCall = false
 
 local function cameraManager()
     local pc = U.playerController()
@@ -21,10 +20,7 @@ end
 local function withCamera(fn)
     local cm = cameraManager()
     if not cm then return false end
-    ownCall = true
-    local ok = pcall(fn, cm)
-    ownCall = false
-    return ok
+    return (pcall(fn, cm))
 end
 
 function M.isCovered() return state ~= nil end
@@ -49,22 +45,12 @@ function M.fadeOut(seconds)
     end)
 end
 
--- Map loads, new camera managers and the game's own travel fades all reset the camera fade,
--- so this runs every frame while covered and right after any fade the game starts itself.
-function M.hold(camera)
+-- Map loads and the game's own travel fade reset the camera fade, so the challenge tick re-applies it.
+-- It must only run from that tick: touching the camera from engine hooks or a per-frame loop
+-- during a level transition crashed the game.
+function M.hold()
     if state ~= "covered" then return end
-    if U.valid(camera) then
-        ownCall = true
-        pcall(function() camera:SetManualCameraFade(1.0, BLACK, false) end)
-        ownCall = false
-        return
-    end
     withCamera(function(cm) cm:SetManualCameraFade(1.0, BLACK, false) end)
-end
-
-function M.onExternalFade()
-    if ownCall then return end
-    M.hold()
 end
 
 function M.reveal(seconds)

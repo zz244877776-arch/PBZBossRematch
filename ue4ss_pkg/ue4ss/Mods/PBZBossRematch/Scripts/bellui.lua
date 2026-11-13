@@ -10,6 +10,7 @@ local VIS_COLLAPSED = 1
 local VIS_HIDDEN = 2
 local NAV_UP = 2
 local NAV_DOWN = 3
+local BUTTON_CLASS = "W_DialogueButton_C"
 
 -- Per-instance settings the menu designer filled in on the original buttons; new buttons start empty.
 local COPIED_BUTTON_FIELDS = { "ClickSound", "OnHoverSound", "bCanPlaySound" }
@@ -17,87 +18,29 @@ local TEMPLATE_BUTTON_FIELDS = { "ShopButton", "ManualSave", "AbilityCultivation
 
 M.OnBossChosen = nil
 
-local menu = nil
+-- Only addresses are kept between frames. A Lua wrapper outliving its object crashes UE4SS as
+-- soon as it is touched (even IsValid), and the engine frees removed widgets on its next GC.
 local menuKey = nil
-local entryButton = nil
-local listButtons = {}
-local hiddenChildren = {}
+local entryKey = nil
+local poolKeys = {}      -- our list buttons, kept in MainBox and reused
+local hiddenKeys = {}    -- { key = address, vis = visibility } of original entries hidden by the list
 local buttonActions = {}
 
-local scratch = nil
-
--- Resolves a localization key by letting one of the game's rich text blocks look it up.
-local function resolveLocKey(ns, key)
-    if not U.valid(Toast.ButtonClass) then return nil end
-    if not U.valid(scratch) then
-        local pc = U.playerController()
-        local wbl = StaticFindObject("/Script/UMG.Default__WidgetBlueprintLibrary")
-        scratch = wbl:Create(pc, Toast.ButtonClass, pc)
-    end
-    local rt = U.valid(scratch) and scratch.PBZCommonLocRichText_39
-    if not U.valid(rt) then return nil end
-    for _, k in ipairs({ key, ns .. "/" .. key, ns .. "." .. key }) do
-        pcall(function() rt:SetText(FText("")) end)
-        pcall(function() rt:SetTextByLocKey(k) end)
-        local s = ""
-        pcall(function() s = rt:GetText():ToString() end)
-        if s ~= "" and s ~= k and s ~= key then return s end
-    end
-    return nil
+local function isActivated(m)
+    local ok, v = pcall(function() return m:IsActivated() end)
+    return ok and v == true
 end
 
-Data.LocResolver = resolveLocKey
-
-local loggedLabel = false
-
-local function setLabel(btn, text)
-    Toast.setLabel(btn, text, not loggedLabel)
-    loggedLabel = true
+local function liveMenu(activeOnly)
+    local m = U.live("W_BellMenu_C", menuKey)
+    if m and activeOnly and not isActivated(m) then return nil end
+    return m
 end
 
-local loggedCopy = false
-
-local function copyButtonSettings(btn)
-    local template = nil
-    for _, field in ipairs(TEMPLATE_BUTTON_FIELDS) do
-        local ok, w = pcall(function() return menu[field] end)
-        if ok and U.valid(w) then
-            template = w
-            break
-        end
-    end
-    if not template then return end
-    for _, field in ipairs(COPIED_BUTTON_FIELDS) do
-        local ok, err = pcall(function() btn[field] = template[field] end)
-        if not loggedCopy then
-            local back = nil
-            pcall(function() back = btn[field] end)
-            U.log("button setting %s ok=%s now=%s %s", field, tostring(ok),
-                tostring(back ~= nil and (type(back) == "boolean" and tostring(back) or U.fullName(back)) or nil),
-                ok and "" or tostring(err))
-        end
-    end
-    loggedCopy = true
-end
-
-local function newButton(label, action)
-    local pc = U.playerController()
-    local wbl = StaticFindObject("/Script/UMG.Default__WidgetBlueprintLibrary")
-    local btn = wbl:Create(menu, Toast.ButtonClass, pc)
-    if not U.valid(btn) then return nil end
-    copyButtonSettings(btn)
-    buttonActions[U.address(btn)] = action
-    return btn
-end
-
-local function addToMainBox(btn)
-    local box = menu.MainBox
-    local close = menu.CloseBtn
-    local closeInBox = false
-    pcall(function() closeInBox = U.valid(close) and box:GetChildIndex(close) >= 0 end)
-    if closeInBox then box:RemoveChild(close) end
-    box:AddChildToVerticalBox(btn)
-    if closeInBox then box:AddChildToVerticalBox(close) end
+-- Drops every reference without touching the objects behind them.
+function M.reset()
+    menuKey, entryKey = nil, nil
+    poolKeys, hiddenKeys, buttonActions = {}, {}, {}
 end
 
 local function childrenOf(box)
@@ -111,6 +54,103 @@ local function childrenOf(box)
     return list
 end
 
+-- Fresh wrappers for MainBox children, by address.
+local function childMap(m)
+    local map = {}
+    for _, c in ipairs(childrenOf(m.MainBox)) do
+        local a = U.address(c)
+        if a then map[a] = c end
+    end
+    return map
+end
+
+-- ===== Localized map names =====
+
+local locCache = {}
+
+-- Resolves a localization key by letting one of the game's rich text blocks look it up. The helper
+-- widget has no parent and is collected by the engine soon after, so it is never reused.
+local function resolveLocKey(ns, key)
+    local cacheKey = ns .. "/" .. key
+    if locCache[cacheKey] ~= nil then return locCache[cacheKey] or nil end
+    if not U.valid(Toast.ButtonClass) then return nil end
+    local pc = U.playerController()
+    local wbl = StaticFindObject("/Script/UMG.Default__WidgetBlueprintLibrary")
+    local ok, scratch = pcall(function() return wbl:Create(pc, Toast.ButtonClass, pc) end)
+    if not ok or not U.valid(scratch) then return nil end
+    local rt = scratch.PBZCommonLocRichText_39
+    if not U.valid(rt) then return nil end
+    local result = false
+    for _, k in ipairs({ key, ns .. "/" .. key, ns .. "." .. key }) do
+        pcall(function() rt:SetText(FText("")) end)
+        pcall(function() rt:SetTextByLocKey(k) end)
+        local s = ""
+        pcall(function() s = rt:GetText():ToString() end)
+        if s ~= "" and s ~= k and s ~= key then
+            result = s
+            break
+        end
+    end
+    locCache[cacheKey] = result
+    return result or nil
+end
+
+Data.LocResolver = resolveLocKey
+
+-- ===== Buttons =====
+
+local loggedLabel = false
+
+local function setLabel(btn, text)
+    Toast.setLabel(btn, text, not loggedLabel)
+    loggedLabel = true
+end
+
+local loggedCopy = false
+
+local function copyButtonSettings(m, btn)
+    local template = nil
+    for _, field in ipairs(TEMPLATE_BUTTON_FIELDS) do
+        local ok, w = pcall(function() return m[field] end)
+        if ok and U.valid(w) then
+            template = w
+            break
+        end
+    end
+    if not template then return end
+    for _, field in ipairs(COPIED_BUTTON_FIELDS) do
+        local ok, err = pcall(function()
+            local v = template[field]
+            -- An empty object slot must not be written back: it would store an invalid pointer.
+            if type(v) ~= "boolean" and not U.valid(v) then error("template value is empty, skipped") end
+            btn[field] = v
+        end)
+        if not loggedCopy then
+            U.log("button setting %s ok=%s %s", field, tostring(ok), ok and "" or tostring(err))
+        end
+    end
+    loggedCopy = true
+end
+
+local function newButton(m)
+    local pc = U.playerController()
+    local wbl = StaticFindObject("/Script/UMG.Default__WidgetBlueprintLibrary")
+    local ok, btn = pcall(function() return wbl:Create(m, Toast.ButtonClass, pc) end)
+    if not ok or not U.valid(btn) then return nil end
+    copyButtonSettings(m, btn)
+    return btn
+end
+
+local function addBeforeClose(m, btn)
+    local box = m.MainBox
+    local close = m.CloseBtn
+    local closeInBox = false
+    pcall(function() closeInBox = U.valid(close) and box:GetChildIndex(close) >= 0 end)
+    if closeInBox then box:RemoveChild(close) end
+    box:AddChildToVerticalBox(btn)
+    if closeInBox then box:AddChildToVerticalBox(close) end
+end
+
 local function isShown(w)
     local ok, vis = pcall(function() return w:GetVisibility() end)
     return ok and vis ~= VIS_COLLAPSED and vis ~= VIS_HIDDEN
@@ -119,7 +159,7 @@ end
 -- Some menu entries sit inside a border or overlay; dig out the button itself.
 local function buttonIn(w, depth)
     if not U.valid(w) or not isShown(w) then return nil end
-    if U.className(w) == "W_DialogueButton_C" then return w end
+    if U.className(w) == BUTTON_CLASS then return w end
     if (depth or 0) >= 2 then return nil end
     local ok, content = pcall(function() return w:GetContent() end)
     if ok and U.valid(content) then return buttonIn(content, (depth or 0) + 1) end
@@ -133,9 +173,10 @@ end
 -- The designer wired explicit up/down links between the original buttons, so gamepad focus
 -- jumps over anything inserted later. Re-chain every visible button, wrapping at both ends.
 local function relinkNavigation()
-    if not U.valid(menu) then return end
+    local m = liveMenu(false)
+    if not m then return end
     local buttons = {}
-    for _, c in ipairs(childrenOf(menu.MainBox)) do
+    for _, c in ipairs(childrenOf(m.MainBox)) do
         local b = buttonIn(c)
         if b then table.insert(buttons, b) end
     end
@@ -150,47 +191,17 @@ local function relinkNavigation()
     U.log("bell menu: navigation linked over %d buttons", n)
 end
 
-local function clearList()
-    for _, b in ipairs(listButtons) do
-        buttonActions[U.address(b)] = nil
-        pcall(function() b:RemoveFromParent() end)
-    end
-    listButtons = {}
-end
-
-local function hideOriginals()
-    if #hiddenChildren > 0 then return end
-    for _, c in ipairs(childrenOf(menu.MainBox)) do
-        local ok, vis = pcall(function() return c:GetVisibility() end)
-        if ok and vis ~= VIS_COLLAPSED then
-            table.insert(hiddenChildren, { widget = c, vis = vis })
-            pcall(function() c:SetVisibility(VIS_COLLAPSED) end)
-        end
-    end
-end
-
-local function showOriginals()
-    for _, h in ipairs(hiddenChildren) do
-        if U.valid(h.widget) then pcall(function() h.widget:SetVisibility(h.vis) end) end
-    end
-    hiddenChildren = {}
-end
-
-local function isActivated(m)
-    local ok, v = pcall(function() return m:IsActivated() end)
-    return ok and v == true
-end
-
 -- The game's own menu logic only manages its own buttons, so keep exactly one dialogue button
 -- in the menu showing the selected appearance whenever one is hovered or focused.
 function M.onButtonFocused(btn)
-    if not U.valid(menu) or not isActivated(menu) or not U.valid(btn) then return end
-    local box = menu.MainBox
+    local m = liveMenu(true)
+    if not m or not U.valid(btn) then return end
+    local box = m.MainBox
     local ok, parent = pcall(function() return btn:GetParent() end)
     if not ok or U.address(parent) ~= U.address(box) then return end
     local target = U.address(btn)
     for _, c in ipairs(childrenOf(box)) do
-        if U.className(c) == "W_DialogueButton_C" then
+        if U.className(c) == BUTTON_CLASS then
             local selected = U.address(c) == target
             pcall(function() c:DoSelectedAppearance(selected) end)
         end
@@ -207,44 +218,101 @@ local function ensureHoverHook()
     U.log("hook %s: %s", path, ok and "ok" or tostring(err))
 end
 
-local function focus(btn)
-    if not U.valid(btn) then return end
+local function focusKey(key)
+    local m = liveMenu(true)
+    local btn = m and childMap(m)[key]
+    if not btn then return end
     pcall(function() btn:SetFocus() end)
     pcall(function() btn:SetUserFocus(U.playerController()) end)
     M.onButtonFocused(btn)
 end
 
-local function buildList(entries)
-    clearList()
-    hideOriginals()
-    for _, e in ipairs(entries) do
-        local b = newButton(e.label, e.action)
-        if b then
-            menu.MainBox:AddChildToVerticalBox(b)
-            table.insert(listButtons, b)
+-- ===== List mode =====
+
+local function collapsePool(m)
+    local children = childMap(m)
+    for _, key in ipairs(poolKeys) do
+        buttonActions[key] = nil
+        local b = children[key]
+        if b then pcall(function() b:SetVisibility(VIS_COLLAPSED) end) end
+    end
+end
+
+local function hideOriginals(m)
+    if #hiddenKeys > 0 then return end
+    local pool = {}
+    for _, key in ipairs(poolKeys) do pool[key] = true end
+    for _, c in ipairs(childrenOf(m.MainBox)) do
+        local key = U.address(c)
+        local ok, vis = pcall(function() return c:GetVisibility() end)
+        if ok and vis ~= VIS_COLLAPSED and not pool[key] then
+            table.insert(hiddenKeys, { key = key, vis = vis })
+            pcall(function() c:SetVisibility(VIS_COLLAPSED) end)
         end
     end
-    local buttons = listButtons
+end
+
+local function showOriginals(m)
+    local children = childMap(m)
+    for _, h in ipairs(hiddenKeys) do
+        local c = children[h.key]
+        if c then pcall(function() c:SetVisibility(h.vis) end) end
+    end
+    hiddenKeys = {}
+end
+
+local function buildList(entries)
+    local m = liveMenu(true)
+    if not m then return end
+    hideOriginals(m)
+    collapsePool(m)
+    local children = childMap(m)
+    for i, e in ipairs(entries) do
+        local key = poolKeys[i]
+        local b = key and children[key]
+        if not b then
+            b = newButton(m)
+            if not b then break end
+            m.MainBox:AddChildToVerticalBox(b)
+            key = U.address(b)
+            poolKeys[i] = key
+        end
+        buttonActions[key] = e.action
+        pcall(function() b:SetVisibility(VIS_VISIBLE) end)
+        setLabel(b, e.label)
+    end
+    local keys = {}
+    for i = 1, #entries do keys[i] = poolKeys[i] end
     local function applyLabels()
-        for i, b in ipairs(buttons) do
-            if U.valid(b) then setLabel(b, entries[i].label) end
+        local mm = liveMenu(true)
+        if not mm then return end
+        local now = childMap(mm)
+        for i, key in ipairs(keys) do
+            local b = now[key]
+            if b then setLabel(b, entries[i].label) end
         end
     end
     U.delay(50, "bellui.labels", function()
         applyLabels()
         relinkNavigation()
-        focus(buttons[1])
+        focusKey(keys[1])
     end)
     U.delay(400, "bellui.labels2", applyLabels)
+end
+
+local function leaveList(m)
+    collapsePool(m)
+    showOriginals(m)
 end
 
 local showMapList
 
 local function backToMenu()
-    clearList()
-    showOriginals()
+    local m = liveMenu(false)
+    if not m then return end
+    leaveList(m)
     relinkNavigation()
-    focus(entryButton)
+    focusKey(entryKey)
 end
 
 local function showBossList(mapId, bosses)
@@ -254,13 +322,12 @@ local function showBossList(mapId, bosses)
         local suffix = ""
         if not arena then suffix = "（未勘察）"
         elseif arena.unsupported then suffix = "（暂不支持）" end
-        local label = b.name .. suffix
         table.insert(entries, {
-            label = label,
+            label = b.name .. suffix,
             action = function()
-                local m = menu
                 backToMenu()
-                pcall(function() m:DeactivateWidget() end)
+                local m = liveMenu(false)
+                if m then pcall(function() m:DeactivateWidget() end) end
                 if M.OnBossChosen then M.OnBossChosen(b) end
             end,
         })
@@ -287,9 +354,11 @@ showMapList = function()
     buildList(entries)
 end
 
+-- ===== Injection =====
+
 local MENU_BUTTON_FIELDS = { "TeleportBtn_BrokenBell", "TeleportBtn", "ShopButton", "ManualSave", "JhsyButton", "ItemUpgradeButton", "CloseBtn", "AbilityCultivation" }
 
--- Removes buttons left behind by a previous load of this mod (e.g. after a hot reload).
+-- Removes buttons left behind by a previous load of this mod (e.g. after a hot reload or a world change).
 local function removeStaleButtons(m)
     local own = {}
     for _, field in ipairs(MENU_BUTTON_FIELDS) do
@@ -297,7 +366,7 @@ local function removeStaleButtons(m)
         if ok and U.valid(w) then own[U.address(w)] = true end
     end
     for _, c in ipairs(childrenOf(m.MainBox)) do
-        if U.className(c) == "W_DialogueButton_C" and not own[U.address(c)] then
+        if U.className(c) == BUTTON_CLASS and not own[U.address(c)] then
             pcall(function() c:RemoveFromParent() end)
             U.log("bell menu: removed stale button")
         end
@@ -305,10 +374,8 @@ local function removeStaleButtons(m)
 end
 
 local function inject(m)
-    menu = m
+    M.reset()
     menuKey = U.address(m)
-    listButtons = {}
-    hiddenChildren = {}
     removeStaleButtons(m)
     local ok, cls = pcall(function() return m.ShopButton:GetClass() end)
     if not ok or not U.valid(cls) then
@@ -317,41 +384,47 @@ local function inject(m)
     end
     Toast.ButtonClass = cls
     ensureHoverHook()
-    entryButton = newButton(Config.EntryLabel, function() showMapList() end)
-    if not entryButton then
+    local entry = newButton(m)
+    if not entry then
         U.log("bell menu: failed to create entry button")
         return
     end
-    addToMainBox(entryButton)
-    local entry = entryButton
-    U.delay(50, "bellui.entryLabel", function()
-        if U.valid(entry) then setLabel(entry, Config.EntryLabel) end
+    addBeforeClose(m, entry)
+    entryKey = U.address(entry)
+    buttonActions[entryKey] = function() showMapList() end
+    setLabel(entry, Config.EntryLabel)
+    local function refresh()
+        local mm = liveMenu(false)
+        local e = mm and childMap(mm)[entryKey]
+        if e then setLabel(e, Config.EntryLabel) end
         relinkNavigation()
-    end)
+    end
+    U.delay(50, "bellui.entryLabel", refresh)
     -- The menu shows or hides some of its own entries while it animates in.
-    U.delay(400, "bellui.entryLabel2", function()
-        if U.valid(entry) then setLabel(entry, Config.EntryLabel) end
-        relinkNavigation()
-    end)
+    U.delay(400, "bellui.entryLabel2", refresh)
     U.log("bell menu: entry button injected")
 end
 
 function M.menuOpen()
     for _, m in ipairs(FindAllOf("W_BellMenu_C") or {}) do
-        if U.valid(m) and isActivated(m) then return true end
+        if isActivated(m) then return true end
     end
     return false
 end
 
 function M.tick(enabled)
     if not enabled then return end
-    if U.valid(menu) and not isActivated(menu) and #hiddenChildren > 0 then
-        clearList()
-        showOriginals()
+    if menuKey then
+        local alive = liveMenu(false)
+        if not alive then
+            M.reset()
+        elseif not isActivated(alive) and #hiddenKeys > 0 then
+            leaveList(alive)
+        end
     end
     for _, m in ipairs(FindAllOf("W_BellMenu_C") or {}) do
-        if U.valid(m) and isActivated(m) then
-            if U.address(m) == menuKey and U.valid(entryButton) then return end
+        if isActivated(m) then
+            if U.address(m) == menuKey and childMap(m)[entryKey] then return end
             local ok, err = pcall(inject, m)
             if not ok then U.log("bell menu inject error: %s", tostring(err)) end
             return
@@ -361,11 +434,9 @@ end
 
 function M.handleClick(btn)
     local action = buttonActions[U.address(btn)]
-    if action then
-        U.gameThread("bellui.click", action)
-        return true
-    end
-    return false
+    if not action or not liveMenu(true) then return false end
+    U.gameThread("bellui.click", action)
+    return true
 end
 
 return M

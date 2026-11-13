@@ -29,8 +29,19 @@ function M.setLabel(btn, text, verbose)
     end
 end
 
+-- Called when the world changes: the old toast widget may already be freed, so just forget it.
+function M.reset()
+    current = nil
+end
+
+local function liveToast(key)
+    return U.live("W_DialogueButton_C", key)
+end
+
+-- `current` is an address, never a wrapper: removed toasts are freed by the engine's next GC.
 local function removeCurrent()
-    if U.valid(current) then pcall(function() current:RemoveFromParent() end) end
+    local w = liveToast(current)
+    if w then pcall(function() w:RemoveFromParent() end) end
     current = nil
 end
 
@@ -45,7 +56,8 @@ function M.show(text, durationMs)
         U.log("toast create failed: %s", tostring(w))
         return
     end
-    current = w
+    local key = U.address(w)
+    current = key
     pcall(function() w:AddToViewport(500) end)
     pcall(function() w:SetVisibility(VIS_HIT_TEST_INVISIBLE) end)
     pcall(function() w:SetAlignmentInViewport({ X = 0.5, Y = 0.5 }) end)
@@ -56,12 +68,12 @@ function M.show(text, durationMs)
     end)
     M.setLabel(w, text)
     U.delay(50, "toast.label", function()
-        if U.valid(w) then M.setLabel(w, text) end
+        local live = liveToast(key)
+        if live then M.setLabel(live, text) end
     end)
 
-    local mine = w
     U.delay(durationMs or 3000, "toast.hide", function()
-        if current == mine then removeCurrent() end
+        if current == key then removeCurrent() end
     end)
 end
 
