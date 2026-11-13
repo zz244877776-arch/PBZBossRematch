@@ -342,11 +342,22 @@ end
 -- Spawners placed for cutscenes ignore Spawn() and only react to the sequence entry points.
 -- ClaimSeqSpawn first: it is what ties the spawner back into the Level Sequence / Flow Graph
 -- that also brings minions, formations, death banners ("斩"), and phase music.
+local function spawnStarted(spawner)
+    local pending, hasAI = false, false
+    pcall(function() pending = spawner:IsSpawnPending() == true end)
+    pcall(function() hasAI = U.valid(spawner.SpawnedAI) end)
+    return pending or hasAI
+end
+
+-- Both entry points can spawn, so the second one only runs when the first did not start anything;
+-- calling both put two copies of the same boss in the arena.
 local function trySequenceSpawn(spawner)
     local okClaim = pcall(function() spawner:ClaimSeqSpawn(false, true, true) end)
-    U.log("ClaimSeqSpawn() ok=%s", tostring(okClaim))
+    local started = okClaim and spawnStarted(spawner)
+    U.log("ClaimSeqSpawn() ok=%s started=%s", tostring(okClaim), tostring(started))
+    if started then return true end
     local okSeq = pcall(function() spawner:SpawnFromSequence() end)
-    U.log("SpawnFromSequence() ok=%s", tostring(okSeq))
+    U.log("SpawnFromSequence() ok=%s started=%s", tostring(okSeq), tostring(okSeq and spawnStarted(spawner)))
     return okClaim or okSeq
 end
 
@@ -360,6 +371,11 @@ local function spawnerLooksSequenced(spawner)
     return string.find(spawnerId(spawner), "Seq", 1, true) ~= nil
 end
 
+-- "Jianou_Seq076" -> 76. Spawners placed for one story sequence share its number.
+local function seqNumber(id)
+    return tonumber(string.match(id or "", "_Seq(%d+)"))
+end
+
 -- "Jianou_Seq076" / "LionDanceBattle_Seq062" -> family prefix used by the same encounter.
 local function encounterPrefix(id)
     if not id or id == "" or id == "None" then return nil end
@@ -367,29 +383,58 @@ local function encounterPrefix(id)
     return prefix
 end
 
--- Boss-only Spawn() skips the encounter's party / formation actors. Pull those in too.
+local SUPPORT_RADIUS = 12000
+local SUPPORT_LOG_RADIUS = 6000
+
+local function bossClassSet()
+    local set = {}
+    for _, b in ipairs(Data.bosses()) do set[string.lower(b.class)] = true end
+    return set
+end
+
+local function mobGroupKey(spawner)
+    local key = nil
+    pcall(function()
+        local g = spawner.MobGroup
+        if U.valid(g) then key = U.address(g) end
+    end)
+    return key
+end
+
+-- Boss-only Spawn() skips the encounter's minions and formation members. Spawners that share the
+-- boss spawner's MobGroup (or its "<Name>_Seq" family) belong to the same fight; other bosses,
+-- such as the next phase, never do: spawning them here put both phases in the arena at once.
 local function activateEncounterSupport(center, mainSpawner)
     if not center then return end
+    local mainKey = U.address(mainSpawner)
     local mainId = spawnerId(mainSpawner)
     local prefix = encounterPrefix(mainId)
+    local seq = seqNumber(mainId)
+    local group = mobGroupKey(mainSpawner)
+    local bosses = bossClassSet()
     local activated = 0
 
-    if prefix then
-        for _, s in ipairs(Data.allSpawners()) do
-            if s ~= mainSpawner and U.valid(s) then
-                local sid = spawnerId(s)
-                if sid ~= "" and string.find(sid, prefix, 1, true) == 1 then
-                    local loc = U.location(s)
-                    if loc and U.dist(loc, center) <= 12000 then
-                        pcall(function() s.ShouldSpawn = true end)
-                        pcall(function() s.SpawnerSaveInfo.IsAlive = true end)
-                        if not trySequenceSpawn(s) then
-                            pcall(function() s:Spawn() end)
-                        end
-                        activated = activated + 1
-                        U.log("encounter support spawner %s", sid)
-                    end
-                end
+    for _, s in ipairs(Data.allSpawners()) do
+        local loc = U.address(s) ~= mainKey and U.location(s)
+        local d = loc and U.dist(loc, center) or math.huge
+        if d <= SUPPORT_RADIUS then
+            local sid = spawnerId(s)
+            local cls = Data.spawnerClass(s)
+            local isBoss = cls ~= nil and bosses[string.lower(cls)] == true
+            local sameGroup = group ~= nil and mobGroupKey(s) == group
+            local sameFamily = (prefix ~= nil and sid ~= "" and string.find(sid, prefix, 1, true) == 1)
+                or (seq ~= nil and seqNumber(sid) == seq)
+            local use = (sameGroup or sameFamily) and not isBoss
+            if use then
+                pcall(function() s.ShouldSpawn = true end)
+                pcall(function() s.SpawnerSaveInfo.IsAlive = true end)
+                local spawned = spawnerLooksSequenced(s) and trySequenceSpawn(s)
+                if not spawned then pcall(function() s:Spawn() end) end
+                activated = activated + 1
+            end
+            if d <= SUPPORT_LOG_RADIUS then
+                U.log("nearby spawner %s class=%s dist=%.0f group=%s family=%s boss=%s used=%s",
+                    sid, tostring(cls), d, tostring(sameGroup), tostring(sameFamily), tostring(isBoss), tostring(use))
             end
         end
     end
@@ -460,11 +505,6 @@ local function setBossFightMusicStage(stage)
     else
         U.log("PBZPersistentAudioSubsystem not found")
     end
-    local music = U.gameInstanceSubsystem("MusicSubsystem") or FindFirstOf("MusicSubsystem")
-    if music then
-        local ok, err = pcall(function() music:SetBossDeathStageEnabled(true) end)
-        U.log("SetBossDeathStageEnabled(true) ok=%s %s", tostring(ok), ok and "" or tostring(err))
-    end
     local cm = cheatManager()
     if not cm then
         U.log("Gm_SetBossFightMusicStage skipped: no cheat manager")
@@ -478,12 +518,91 @@ local function setBossFightMusicStage(stage)
     end
 end
 
+local NEXT_STAGE_RADIUS = 5000
+
+-- Phases named "<Boss>_P2" are found from the codex. Others, such as 七星剑阵：大师兄 followed by
+-- 大师兄的绝望剑意, only show up as the boss spawner of the next story sequence next to this one
+-- (Jianou_Seq076 -> Jianou_Seq077, LionDanceBattle_Seq062 -> LionDancerP2_Seq063).
+local function nextStageOf(boss)
+    local byName = Data.nextStage(boss)
+    if byName then return byName end
+    local seq = seqNumber(st.spawnerId)
+    if not seq or not st.spawnerLoc then return nil end
+    local current = string.lower(boss.class)
+    for _, s in ipairs(Data.allSpawners()) do
+        if seqNumber(spawnerId(s)) == seq + 1 then
+            local cls = Data.spawnerClass(s)
+            local loc = U.location(s)
+            if cls and string.lower(cls) ~= current and loc and U.dist(loc, st.spawnerLoc) <= NEXT_STAGE_RADIUS then
+                for _, b in ipairs(Data.bosses()) do
+                    if string.lower(b.class) == string.lower(cls) then return b end
+                end
+            end
+        end
+    end
+    return nil
+end
+
+local MUSIC_VOLUME_RADIUS = 15000
+local MUSIC_TYPE_COMBAT = 1
+
+local function compact(s)
+    return string.lower((string.gsub(tostring(s or ""), "[^%w]", "")))
+end
+
+local function arrayItems(arr)
+    local items = {}
+    pcall(function() arr:ForEach(function(_, elem) table.insert(items, elem:get()) end) end)
+    return items
+end
+
+-- A later phase gets its own combat music through the arena's music volume ("specific enemy" ->
+-- music state). The game switches when that enemy engages; a phase spawned by this mod next to an
+-- already-present player does not always trigger it, so set the matching state directly.
+local function applyStageMusic(stage)
+    local music = U.worldSubsystem("MusicSubsystem")
+    local center = st.spawnerLoc or U.location(U.playerPawn())
+    if not music or not center then
+        U.log("stage music: no music subsystem")
+        return
+    end
+    local wanted = compact(string.gsub(stage.id, "^BP_Monster_", ""))
+    local applied = false
+    for _, vol in ipairs(FindAllOf("PBZMusicVolume") or {}) do
+        local loc = U.location(vol)
+        if loc and U.dist(loc, center) <= MUSIC_VOLUME_RADIUS then
+            local names = arrayItems(vol.SpecificEnemyNames)
+            local states = arrayItems(vol.SpecificMusicState_InCombat)
+            local labels = {}
+            for i, n in ipairs(names) do
+                local name = U.str(n)
+                table.insert(labels, name)
+                local key = compact(name)
+                if not applied and key ~= "" and (string.find(wanted, key, 1, true) or string.find(key, wanted, 1, true)) then
+                    local state = states[i]
+                    if U.valid(state) then
+                        local ok, err = pcall(function() music:SetMusicState(state, MUSIC_TYPE_COMBAT, true) end)
+                        U.log("stage music: %s -> %s ok=%s %s", name, U.fullName(state), tostring(ok), ok and "" or tostring(err))
+                        applied = ok
+                    end
+                end
+            end
+            U.log("music volume %s dist=%.0f enemies=[%s]", U.fullName(vol):match("[^%.]+$") or "?", U.dist(loc, center), table.concat(labels, ","))
+        end
+    end
+    if not applied then
+        pcall(function() music:UpdateGameplayMusic(false) end)
+        U.log("stage music: no specific state for %s, asked the game to refresh combat music", stage.id)
+    end
+end
+
 local function startSpawn(spawner)
     if not st.vetoed then st.vetoed = Save.enterVeto() end
     -- A previous phase's death flag must not carry into this spawn, or the next tick "wins" immediately.
     st.bossDied = false
     st.playerDied = false
     st.spawnerKey, st.spawnerClass = remember(spawner)
+    st.spawnerId = spawnerId(spawner)
     st.spawnerLoc = U.location(spawner)
     local hasAI = false
     pcall(function() hasAI = U.valid(spawner.SpawnedAI) and not isDead(spawner.SpawnedAI) end)
@@ -668,10 +787,36 @@ local function tickSpawning()
     end
 end
 
+-- A level sequence started for the encounter can bring the next phase in early; it must only
+-- appear once the current phase is down.
+local function dismissEarlyNextStage()
+    local nxt = nextStageOf(st.boss)
+    if not nxt then return end
+    for _, a in ipairs(FindAllOf(nxt.class) or {}) do
+        if U.valid(a) and not isDead(a) then
+            local key = U.address(a)
+            local spawner = Data.findSpawner(nxt.class)
+            local viaSpawner = false
+            if spawner then
+                pcall(function()
+                    if U.address(spawner.SpawnedAI) == key then
+                        spawner:Despawn()
+                        viaSpawner = true
+                    end
+                end)
+            end
+            if not viaSpawner then pcall(function() a:K2_DestroyActor() end) end
+            U.log("early %s removed (spawner=%s)", nxt.id, tostring(viaSpawner))
+        end
+    end
+end
+
 local function beginFight()
+    dismissEarlyNextStage()
     unfreezeBoss()
     setPhase("fighting")
     Toast.show("开战：" .. st.boss.name, 2000)
+    if st.rootBoss then applyStageMusic(st.boss) end
 end
 
 -- Numbers are driven by timers rather than the 300 ms tick so each one lasts a full second.
@@ -701,6 +846,7 @@ local function tickPreparing()
     local ready = elapsed() >= PREPARE_MIN_S and Streaming.idle()
     if not ready and elapsed() < PREPARE_TIMEOUT_S then return end
     U.log("arena ready after %ds (streaming idle=%s)", elapsed(), tostring(Streaming.idle()))
+    dismissEarlyNextStage()
     Curtain.reveal(REVEAL_FADE_S)
     startCountdown()
 end
@@ -734,6 +880,7 @@ local function enterStage(stage, pawn)
     U.log("stage %s is up", stage.id)
     Toast.show("下一阶段：" .. stage.name, 3000)
     setPhase("fighting")
+    applyStageMusic(stage)
 end
 
 -- After a phase dies the game may run its own transition; give it a moment, then spawn the next phase ourselves.
@@ -768,7 +915,7 @@ end
 local function tickFighting()
     local boss = bossPawn()
     if st.bossDied or not boss or isDead(boss) then
-        local nextStage = Data.nextStage(st.boss)
+        local nextStage = nextStageOf(st.boss)
         if nextStage then
             U.log("%s down, waiting for %s", st.boss.id, nextStage.id)
             st.rootBoss = st.rootBoss or st.boss
