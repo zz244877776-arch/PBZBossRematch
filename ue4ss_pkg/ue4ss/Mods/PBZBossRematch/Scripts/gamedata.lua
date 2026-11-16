@@ -462,6 +462,23 @@ function M.markUnsupported(boss)
     U.saveTable(ARENA_CACHE_PATH, arenaCache)
 end
 
+-- After a sky-stored spawner finally produces a living boss on solid ground, remember that
+-- XYZ so the next rematch can hop next to the real arena instead of a map-entry bell.
+function M.rememberArenaLoc(boss, loc, spawnerId)
+    if not boss or not loc or not U.saneWorldLoc(loc) then return false end
+    local bell = M.nearestBell(boss.map, loc)
+    arenaCache[boss.id] = {
+        map = boss.map,
+        x = math.floor(loc.X), y = math.floor(loc.Y), z = math.floor(loc.Z),
+        bell = bell and bell.id or "",
+        spawnerId = spawnerId or (arenaCache[boss.id] and arenaCache[boss.id].spawnerId) or "",
+    }
+    U.saveTable(ARENA_CACHE_PATH, arenaCache)
+    U.log("arena remembered %s at (%.0f, %.0f, %.0f) bell=%s",
+        boss.id, loc.X, loc.Y, loc.Z, arenaCache[boss.id].bell)
+    return true
+end
+
 function M.learnArenas()
     local bosses = {}
     for _, b in ipairs(M.bosses()) do bosses[string.lower(b.class)] = b end
