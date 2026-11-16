@@ -4,6 +4,7 @@ local Data = require("gamedata")
 local Save = require("savesnap")
 local Toast = require("toast")
 local Streaming = require("streaming")
+local Curtain = require("curtain")
 
 local M = {}
 
@@ -23,9 +24,19 @@ local RELOAD_TIMEOUT_S = 20
 local RELOAD_MIN_S = 5
 local SCAN_STABLE_REGIONS = 3
 local STAGE_WAIT_S = 6
+local STAGE_FADE_AT_S = 4
+local STAGE_FADE_S = 1.0
+local PREPARE_MIN_S = 2
+local PREPARE_TIMEOUT_S = 15
+local REVEAL_FADE_S = 0.8
 
--- idle -> traveling -> locating [-> scanning -> traveling -> locating] -> spawning -> fighting -> ending -> reloading -> idle
+-- idle -> traveling -> locating [-> scanning -> traveling -> locating] -> spawning -> preparing -> countdown
+--   -> fighting -> ending -> reloading -> idle
 local st = { phase = "idle" }
+
+-- Defined later; start/return call these before their assignment runs at load time.
+local clearStickyCombatMusic
+local applyStageMusic
 
 function M.phase() return st.phase end
 function M.isActive() return st.phase ~= "idle" end
@@ -109,6 +120,21 @@ local function travel(level, transform, bellId)
     return true
 end
 
+-- Actors are remembered by address and class only, then looked up among live objects each time:
+-- a corpse or spawner the engine has already freed must never be touched through an old wrapper.
+local function remember(actor)
+    if not actor then return nil, nil end
+    return U.address(actor), U.className(actor)
+end
+
+local function bossPawn()
+    return U.live(st.bossClass, st.bossKey)
+end
+
+local function setBoss(pawn)
+    st.bossKey, st.bossClass = remember(pawn)
+end
+
 local function isDead(actor)
     local ok, v = pcall(function() return actor:IsDead() end)
     return ok and v == true
@@ -119,11 +145,87 @@ local function pawnAddress()
     return pawn and U.address(pawn) or nil
 end
 
+local function controllerOf(pawn)
+    local ok, c = pcall(function() return pawn.Controller end)
+    return ok and U.valid(c) and c or nil
+end
+
+local function sgameAIComponents(pawn, controller)
+    local cls = StaticFindObject("/Script/SGameAI.SGameAIComponent")
+    local list = {}
+    if not U.valid(cls) then return list end
+    for _, owner in ipairs({ pawn, controller }) do
+        if U.valid(owner) then
+            local ok, comp = pcall(function() return owner:GetComponentByClass(cls) end)
+            if ok and U.valid(comp) then table.insert(list, comp) end
+        end
+    end
+    return list
+end
+
+local function call(what, fn)
+    local ok, err = pcall(fn)
+    U.log("%s ok=%s %s", what, tostring(ok), ok and "" or tostring(err))
+end
+
+-- The game's own hit-stop keeps rewriting time dilation, so the boss is also stopped through
+-- its character freeze, the SGameAI component and the behavior tree. The AI controller can be
+-- possessed a moment after spawning, so the controller-side calls repeat when it changes.
+local function setFrozen(pawn, frozen)
+    if not U.valid(pawn) then return end
+    local d = frozen and 0.0 or 1.0
+    pcall(function() pawn.CustomTimeDilation = d end)
+    local controller = controllerOf(pawn)
+    if controller then pcall(function() controller.CustomTimeDilation = d end) end
+    local key = tostring(U.address(pawn)) .. "/" .. tostring(controller and U.address(controller))
+    if frozen and st.freezeKey == key then return end
+    st.freezeKey = frozen and key or nil
+    local verb = frozen and "freeze" or "release"
+    call(verb .. " FreezeCharacter", function() pawn:FreezeCharacter(frozen) end)
+    for _, comp in ipairs(sgameAIComponents(pawn, controller)) do
+        if frozen then
+            call(verb .. " StopAI", function() comp:StopAI() end)
+        else
+            call(verb .. " StartAI", function() comp:StartAI() end)
+        end
+    end
+    if controller then
+        local lib = StaticFindObject("/Script/SGameAI.Default__SGameAIFunctionLibrary")
+        local brain = nil
+        pcall(function() brain = controller.BrainComponent end)
+        if U.valid(lib) and U.valid(brain) then
+            if frozen then
+                call(verb .. " PauseLogic", function() lib:PauseLogic(brain, "PBZBossRematch") end)
+            else
+                call(verb .. " ResumeLogic", function() lib:ResumeLogic(brain, "PBZBossRematch") end)
+            end
+        end
+        local perception = nil
+        pcall(function() perception = controller.PerceptionComponent end)
+        if U.valid(lib) and U.valid(perception) then
+            call(verb .. " SetSensesEnabled", function() lib:SetSensesEnabled(perception, not frozen) end)
+        end
+        call(verb .. " StopMovement", function() controller:StopMovement() end)
+    end
+end
+
+local function unfreezeBoss()
+    if st.frozenKey then
+        local p = U.live(st.frozenClass, st.frozenKey)
+        if p then setFrozen(p, false) end
+        U.log("boss released")
+        st.frozenKey, st.frozenClass = nil, nil
+    end
+end
+
 local function returnToStart(reason, delayMs)
     if st.phase == "ending" or st.phase == "reloading" then return end
     st.endReason = reason
     setPhase("ending")
+    unfreezeBoss()
+    Curtain.reveal(0.3)
     Streaming.clear()
+    clearStickyCombatMusic()
     U.delay(delayMs or 0, "challenge.return", function()
         Save.exitVeto()
         if not Save.restoreFiles() then
@@ -204,6 +306,8 @@ function M.start(boss)
 
     st = { phase = "idle", boss = boss, level = level, mapBells = mapBells }
     Toast.show("宿敌再战：" .. boss.name, 3000)
+    clearStickyCombatMusic()
+    if Config.LoadingCurtain ~= false then Curtain.cover() end
 
     local transform = firstBell.transform
     -- Only step straight to the boss when this map is already loaded. Otherwise fast-travel
@@ -216,6 +320,7 @@ function M.start(boss)
 
     local tok, terr = travel(level, transform, firstBell.id)
     if not tok then
+        Curtain.reveal(0.3)
         Save.clearState()
         st = { phase = "idle" }
         Toast.show(terr, 5000)
@@ -243,11 +348,22 @@ end
 -- Spawners placed for cutscenes ignore Spawn() and only react to the sequence entry points.
 -- ClaimSeqSpawn first: it is what ties the spawner back into the Level Sequence / Flow Graph
 -- that also brings minions, formations, death banners ("斩"), and phase music.
+local function spawnStarted(spawner)
+    local pending, hasAI = false, false
+    pcall(function() pending = spawner:IsSpawnPending() == true end)
+    pcall(function() hasAI = U.valid(spawner.SpawnedAI) end)
+    return pending or hasAI
+end
+
+-- Both entry points can spawn, so the second one only runs when the first did not start anything;
+-- calling both put two copies of the same boss in the arena.
 local function trySequenceSpawn(spawner)
     local okClaim = pcall(function() spawner:ClaimSeqSpawn(false, true, true) end)
-    U.log("ClaimSeqSpawn() ok=%s", tostring(okClaim))
+    local started = okClaim and spawnStarted(spawner)
+    U.log("ClaimSeqSpawn() ok=%s started=%s", tostring(okClaim), tostring(started))
+    if started then return true end
     local okSeq = pcall(function() spawner:SpawnFromSequence() end)
-    U.log("SpawnFromSequence() ok=%s", tostring(okSeq))
+    U.log("SpawnFromSequence() ok=%s started=%s", tostring(okSeq), tostring(okSeq and spawnStarted(spawner)))
     return okClaim or okSeq
 end
 
@@ -261,6 +377,11 @@ local function spawnerLooksSequenced(spawner)
     return string.find(spawnerId(spawner), "Seq", 1, true) ~= nil
 end
 
+-- "Jianou_Seq076" -> 76. Spawners placed for one story sequence share its number.
+local function seqNumber(id)
+    return tonumber(string.match(id or "", "_Seq(%d+)"))
+end
+
 -- "Jianou_Seq076" / "LionDanceBattle_Seq062" -> family prefix used by the same encounter.
 local function encounterPrefix(id)
     if not id or id == "" or id == "None" then return nil end
@@ -268,29 +389,58 @@ local function encounterPrefix(id)
     return prefix
 end
 
--- Boss-only Spawn() skips the encounter's party / formation actors. Pull those in too.
+local SUPPORT_RADIUS = 12000
+local SUPPORT_LOG_RADIUS = 6000
+
+local function bossClassSet()
+    local set = {}
+    for _, b in ipairs(Data.bosses()) do set[string.lower(b.class)] = true end
+    return set
+end
+
+local function mobGroupKey(spawner)
+    local key = nil
+    pcall(function()
+        local g = spawner.MobGroup
+        if U.valid(g) then key = U.address(g) end
+    end)
+    return key
+end
+
+-- Boss-only Spawn() skips the encounter's minions and formation members. Spawners that share the
+-- boss spawner's MobGroup (or its "<Name>_Seq" family) belong to the same fight; other bosses,
+-- such as the next phase, never do: spawning them here put both phases in the arena at once.
 local function activateEncounterSupport(center, mainSpawner)
     if not center then return end
+    local mainKey = U.address(mainSpawner)
     local mainId = spawnerId(mainSpawner)
     local prefix = encounterPrefix(mainId)
+    local seq = seqNumber(mainId)
+    local group = mobGroupKey(mainSpawner)
+    local bosses = bossClassSet()
     local activated = 0
 
-    if prefix then
-        for _, s in ipairs(Data.allSpawners()) do
-            if s ~= mainSpawner and U.valid(s) then
-                local sid = spawnerId(s)
-                if sid ~= "" and string.find(sid, prefix, 1, true) == 1 then
-                    local loc = U.location(s)
-                    if loc and U.dist(loc, center) <= 12000 then
-                        pcall(function() s.ShouldSpawn = true end)
-                        pcall(function() s.SpawnerSaveInfo.IsAlive = true end)
-                        if not trySequenceSpawn(s) then
-                            pcall(function() s:Spawn() end)
-                        end
-                        activated = activated + 1
-                        U.log("encounter support spawner %s", sid)
-                    end
-                end
+    for _, s in ipairs(Data.allSpawners()) do
+        local loc = U.address(s) ~= mainKey and U.location(s)
+        local d = loc and U.dist(loc, center) or math.huge
+        if d <= SUPPORT_RADIUS then
+            local sid = spawnerId(s)
+            local cls = Data.spawnerClass(s)
+            local isBoss = cls ~= nil and bosses[string.lower(cls)] == true
+            local sameGroup = group ~= nil and mobGroupKey(s) == group
+            local sameFamily = (prefix ~= nil and sid ~= "" and string.find(sid, prefix, 1, true) == 1)
+                or (seq ~= nil and seqNumber(sid) == seq)
+            local use = (sameGroup or sameFamily) and not isBoss
+            if use then
+                pcall(function() s.ShouldSpawn = true end)
+                pcall(function() s.SpawnerSaveInfo.IsAlive = true end)
+                local spawned = spawnerLooksSequenced(s) and trySequenceSpawn(s)
+                if not spawned then pcall(function() s:Spawn() end) end
+                activated = activated + 1
+            end
+            if d <= SUPPORT_LOG_RADIUS then
+                U.log("nearby spawner %s class=%s dist=%.0f group=%s family=%s boss=%s used=%s",
+                    sid, tostring(cls), d, tostring(sameGroup), tostring(sameFamily), tostring(isBoss), tostring(use))
             end
         end
     end
@@ -361,11 +511,6 @@ local function setBossFightMusicStage(stage)
     else
         U.log("PBZPersistentAudioSubsystem not found")
     end
-    local music = U.gameInstanceSubsystem("MusicSubsystem") or FindFirstOf("MusicSubsystem")
-    if music then
-        local ok, err = pcall(function() music:SetBossDeathStageEnabled(true) end)
-        U.log("SetBossDeathStageEnabled(true) ok=%s %s", tostring(ok), ok and "" or tostring(err))
-    end
     local cm = cheatManager()
     if not cm then
         U.log("Gm_SetBossFightMusicStage skipped: no cheat manager")
@@ -379,12 +524,106 @@ local function setBossFightMusicStage(stage)
     end
 end
 
+local NEXT_STAGE_RADIUS = 5000
+
+-- Phases named "<Boss>_P2" are found from the codex. Others, such as 七星剑阵：大师兄 followed by
+-- 大师兄的绝望剑意, only show up as the boss spawner of the next story sequence next to this one
+-- (Jianou_Seq076 -> Jianou_Seq077, LionDanceBattle_Seq062 -> LionDancerP2_Seq063).
+local function nextStageOf(boss)
+    local byName = Data.nextStage(boss)
+    if byName then return byName end
+    local seq = seqNumber(st.spawnerId)
+    if not seq or not st.spawnerLoc then return nil end
+    local current = string.lower(boss.class)
+    for _, s in ipairs(Data.allSpawners()) do
+        if seqNumber(spawnerId(s)) == seq + 1 then
+            local cls = Data.spawnerClass(s)
+            local loc = U.location(s)
+            if cls and string.lower(cls) ~= current and loc and U.dist(loc, st.spawnerLoc) <= NEXT_STAGE_RADIUS then
+                for _, b in ipairs(Data.bosses()) do
+                    if string.lower(b.class) == string.lower(cls) then return b end
+                end
+            end
+        end
+    end
+    return nil
+end
+
+local MUSIC_VOLUME_RADIUS = 15000
+local MUSIC_TYPE_COMBAT = 1
+
+local function compact(s)
+    return string.lower((string.gsub(tostring(s or ""), "[^%w]", "")))
+end
+
+local function arrayItems(arr)
+    local items = {}
+    pcall(function() arr:ForEach(function(_, elem) table.insert(items, elem:get()) end) end)
+    return items
+end
+
+-- Combat music sticks to the last engaged enemy. Rematch jumps between bosses without the game's
+-- normal disengage, so the previous fight's track can keep playing until we set a new state.
+clearStickyCombatMusic = function()
+    local music = U.worldSubsystem("MusicSubsystem")
+    if not music then return end
+    pcall(function() music:ClearMusic(0.5, true, false) end)
+    pcall(function() music:UpdateGameplayMusic(true) end)
+    U.log("cleared sticky combat music")
+end
+
+-- Arena music volumes map "specific enemy" names to Ak combat states. Prefer the longest name
+-- match so "LionDancer" wins over a short key like "P2" when both could match a later phase id.
+applyStageMusic = function(stage)
+    local music = U.worldSubsystem("MusicSubsystem")
+    local center = st.spawnerLoc or U.location(U.playerPawn())
+    if not music or not center then
+        U.log("stage music: no music subsystem")
+        return
+    end
+    -- Drop sticky combat from the last rematch before forcing this boss's state.
+    pcall(function() music:ClearMusic(0.35, true, false) end)
+    local wanted = compact(string.gsub(stage.id, "^BP_Monster_", ""))
+    local best, bestLen, bestName, bestVol = nil, -1, nil, nil
+    for _, vol in ipairs(FindAllOf("PBZMusicVolume") or {}) do
+        local loc = U.location(vol)
+        if loc and U.dist(loc, center) <= MUSIC_VOLUME_RADIUS then
+            local names = arrayItems(vol.SpecificEnemyNames)
+            local states = arrayItems(vol.SpecificMusicState_InCombat)
+            local labels = {}
+            for i, n in ipairs(names) do
+                local name = U.str(n)
+                table.insert(labels, name)
+                local key = compact(name)
+                if key ~= "" and (string.find(wanted, key, 1, true) or string.find(key, wanted, 1, true)) then
+                    local state = states[i]
+                    if U.valid(state) and #key > bestLen then
+                        best, bestLen, bestName, bestVol = state, #key, name, vol
+                    end
+                end
+            end
+            U.log("music volume %s dist=%.0f enemies=[%s]", U.fullName(vol):match("[^%.]+$") or "?", U.dist(loc, center), table.concat(labels, ","))
+        end
+    end
+    if best then
+        local ok, err = pcall(function() music:SetMusicState(best, MUSIC_TYPE_COMBAT, true) end)
+        U.log("stage music: %s -> %s ok=%s %s", bestName, U.fullName(best), tostring(ok), ok and "" or tostring(err))
+        if ok then
+            pcall(function() music:UpdateGameplayMusic(false) end)
+            return
+        end
+    end
+    pcall(function() music:UpdateGameplayMusic(false) end)
+    U.log("stage music: no specific state for %s, asked the game to refresh combat music", stage.id)
+end
+
 local function startSpawn(spawner)
     if not st.vetoed then st.vetoed = Save.enterVeto() end
     -- A previous phase's death flag must not carry into this spawn, or the next tick "wins" immediately.
     st.bossDied = false
     st.playerDied = false
-    st.spawner = spawner
+    st.spawnerKey, st.spawnerClass = remember(spawner)
+    st.spawnerId = spawnerId(spawner)
     st.spawnerLoc = U.location(spawner)
     local hasAI = false
     pcall(function() hasAI = U.valid(spawner.SpawnedAI) and not isDead(spawner.SpawnedAI) end)
@@ -526,7 +765,7 @@ end
 
 local function placePlayerNearBoss()
     local pawn = U.playerPawn()
-    local bossLoc = st.spawnerLoc or U.location(st.bossPawn)
+    local bossLoc = st.spawnerLoc or U.location(bossPawn())
     local p = U.location(pawn)
     if not pawn or not bossLoc or not p then return end
     if U.dist(p, bossLoc) <= NEAR_BOSS_DISTANCES[#NEAR_BOSS_DISTANCES] then return end
@@ -544,22 +783,100 @@ local function placePlayerNearBoss()
 end
 
 local function tickSpawning()
+    local spawner = U.live(st.spawnerClass, st.spawnerKey)
     local ai = nil
-    pcall(function() ai = st.spawner.SpawnedAI end)
+    if spawner then pcall(function() ai = spawner.SpawnedAI end) end
     if U.valid(ai) and not isDead(ai) then
-        st.bossPawn = ai
+        setBoss(ai)
         placePlayerNearBoss()
-        setPhase("fighting")
-        Toast.show((st.rootBoss and "下一阶段：" or "挑战开始：") .. st.boss.name, 3000)
+        if st.rootBoss and not Curtain.isCovered() then
+            setPhase("fighting")
+            Toast.show("下一阶段：" .. st.boss.name, 3000)
+            return
+        end
+        st.frozenKey, st.frozenClass = st.bossKey, st.bossClass
+        setFrozen(ai, true)
+        setPhase("preparing")
         return
     end
-    if not st.altSpawnTried and elapsed() > ALT_SPAWN_AFTER_S then
+    if not st.altSpawnTried and elapsed() > ALT_SPAWN_AFTER_S and spawner then
         st.altSpawnTried = true
-        trySequenceSpawn(st.spawner)
+        trySequenceSpawn(spawner)
     end
     if elapsed() > SPAWN_TIMEOUT_S then
         abort(st.rootBoss and (st.boss.name .. " 没有出现，挑战结束") or "Boss 没有出现")
     end
+end
+
+-- A level sequence started for the encounter can bring the next phase in early; it must only
+-- appear once the current phase is down.
+local function dismissEarlyNextStage()
+    local nxt = nextStageOf(st.boss)
+    if not nxt then return end
+    for _, a in ipairs(FindAllOf(nxt.class) or {}) do
+        if U.valid(a) and not isDead(a) then
+            local key = U.address(a)
+            local spawner = Data.findSpawner(nxt.class)
+            local viaSpawner = false
+            if spawner then
+                pcall(function()
+                    if U.address(spawner.SpawnedAI) == key then
+                        spawner:Despawn()
+                        viaSpawner = true
+                    end
+                end)
+            end
+            if not viaSpawner then pcall(function() a:K2_DestroyActor() end) end
+            U.log("early %s removed (spawner=%s)", nxt.id, tostring(viaSpawner))
+        end
+    end
+end
+
+local function beginFight()
+    dismissEarlyNextStage()
+    unfreezeBoss()
+    setPhase("fighting")
+    Toast.show("开战：" .. st.boss.name, 2000)
+    -- Always set this boss's track. Otherwise the previous rematch's combat music keeps playing
+    -- through phase 1 (seen with 舞狮尊主 still on 雷婷 / 剑欧's BGM).
+    applyStageMusic(st.boss)
+end
+
+-- Numbers are driven by timers rather than the 300 ms tick so each one lasts a full second.
+local function startCountdown()
+    local seconds = math.floor(tonumber(Config.CountdownSeconds) or 3)
+    setPhase("countdown")
+    if seconds <= 0 then return beginFight() end
+    local id = os.time() .. "-" .. tostring(math.random(1, 1e6))
+    st.countdownId = id
+    for i = 0, seconds do
+        U.delay(i * 1000, "challenge.countdown", function()
+            if st.phase ~= "countdown" or st.countdownId ~= id then return end
+            if i < seconds then
+                Toast.show(string.format("准备迎战 %s  %d", st.boss.name, seconds - i), 1100)
+            else
+                beginFight()
+            end
+        end)
+    end
+end
+
+-- The boss stays frozen behind the black screen until the world around it has finished streaming in.
+local function tickPreparing()
+    local boss = bossPawn()
+    if not boss then return abort("Boss 加载失败") end
+    setFrozen(boss, true)
+    local ready = elapsed() >= PREPARE_MIN_S and Streaming.idle()
+    if not ready and elapsed() < PREPARE_TIMEOUT_S then return end
+    U.log("arena ready after %ds (streaming idle=%s)", elapsed(), tostring(Streaming.idle()))
+    dismissEarlyNextStage()
+    Curtain.reveal(REVEAL_FADE_S)
+    startCountdown()
+end
+
+local function tickCountdown()
+    local boss = bossPawn()
+    if boss then setFrozen(boss, true) end
 end
 
 local function victory()
@@ -576,8 +893,9 @@ local function livePawnOf(boss)
 end
 
 local function enterStage(stage, pawn)
+    Curtain.reveal(REVEAL_FADE_S)
     st.boss = stage
-    st.bossPawn = pawn
+    setBoss(pawn)
     st.bossDied = false
     st.playerDied = false
     st.musicStage = (st.musicStage or 0) + 1
@@ -585,14 +903,24 @@ local function enterStage(stage, pawn)
     U.log("stage %s is up", stage.id)
     Toast.show("下一阶段：" .. stage.name, 3000)
     setPhase("fighting")
+    applyStageMusic(stage)
 end
 
 -- After a phase dies the game may run its own transition; give it a moment, then spawn the next phase ourselves.
+-- The death performance plays out first, then the screen fades to black so the old body is never
+-- seen next to the new phase.
 local function tickTransition()
     local stage = st.nextStage
     local pawn = livePawnOf(stage)
     if pawn then return enterStage(stage, pawn) end
+    if elapsed() >= STAGE_FADE_AT_S and Config.LoadingCurtain ~= false then Curtain.fadeOut(STAGE_FADE_S) end
     if elapsed() < STAGE_WAIT_S then return end
+    local body = U.live(st.deadClass, st.deadKey)
+    if body then
+        pcall(function() body:SetActorHiddenInGame(true) end)
+        U.log("previous stage body hidden")
+    end
+    st.deadKey, st.deadClass = nil, nil
     local spawner = Data.findSpawner(stage.class)
     if not spawner then
         U.log("no spawner for %s, finishing after %s", stage.id, st.boss.id)
@@ -608,13 +936,15 @@ local function tickTransition()
 end
 
 local function tickFighting()
-    if st.bossDied or not U.valid(st.bossPawn) or isDead(st.bossPawn) then
-        local nextStage = Data.nextStage(st.boss)
+    local boss = bossPawn()
+    if st.bossDied or not boss or isDead(boss) then
+        local nextStage = nextStageOf(st.boss)
         if nextStage then
             U.log("%s down, waiting for %s", st.boss.id, nextStage.id)
             st.rootBoss = st.rootBoss or st.boss
             st.nextStage = nextStage
-            st.bossPawn = nil
+            st.deadKey, st.deadClass = st.bossKey, st.bossClass
+            st.bossKey, st.bossClass = nil, nil
             st.bossDied = false
             return setPhase("transition")
         end
@@ -675,11 +1005,14 @@ function M.onBellMenuOpen()
 end
 
 function M.tick()
+    Curtain.hold()
     local p = st.phase
     if p == "traveling" then tickTraveling()
     elseif p == "locating" then tickLocating()
     elseif p == "scanning" then tickScanning()
     elseif p == "spawning" then tickSpawning()
+    elseif p == "preparing" then tickPreparing()
+    elseif p == "countdown" then tickCountdown()
     elseif p == "fighting" then tickFighting()
     elseif p == "transition" then tickTransition()
     elseif p == "reloading" then tickReloading()
@@ -688,7 +1021,7 @@ end
 
 function M.onEnemyDied(character)
     if st.phase ~= "fighting" then return end
-    if U.address(character) == U.address(st.bossPawn) then
+    if st.bossKey and U.address(character) == st.bossKey then
         U.log("boss died")
         st.bossDied = true
     end
@@ -696,7 +1029,8 @@ end
 
 function M.onPlayerDeadWidget()
     local p = st.phase
-    if p == "fighting" or p == "transition" or p == "spawning" or p == "locating" or p == "scanning" or p == "traveling" then
+    if p == "fighting" or p == "transition" or p == "spawning" or p == "preparing" or p == "countdown"
+        or p == "locating" or p == "scanning" or p == "traveling" then
         U.log("player died")
         st.playerDied = true
         if p ~= "fighting" then returnToStart("defeat", Config.DefeatReturnDelayMs) end
@@ -704,6 +1038,7 @@ function M.onPlayerDeadWidget()
 end
 
 function M.onMapLoaded()
+    Curtain.hold()
     if st.phase == "reloading" then
         U.log("map loaded while reloading")
     end
@@ -725,14 +1060,15 @@ function M.quit()
 end
 
 function M.killBoss()
-    if st.phase ~= "fighting" or not U.valid(st.bossPawn) then return end
+    local boss = bossPawn()
+    if st.phase ~= "fighting" or not boss then return end
     local geKill = FindObject("BlueprintGeneratedClass", "GE_Kill_C")
     local asl = StaticFindObject("/Script/GameplayAbilities.Default__AbilitySystemBlueprintLibrary")
     if not U.valid(geKill) or not U.valid(asl) then
         U.log("kill: GE_Kill_C or AbilitySystemBlueprintLibrary missing")
         return
     end
-    local target = asl:GetAbilitySystemComponent(st.bossPawn)
+    local target = asl:GetAbilitySystemComponent(boss)
     local source = asl:GetAbilitySystemComponent(U.playerPawn())
     local ok, err = pcall(function()
         source:BP_ApplyGameplayEffectToTarget(geKill, target, 1.0, source:MakeEffectContext())

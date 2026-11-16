@@ -7,7 +7,6 @@ local BellUI = require("bellui")
 local Challenge = require("challenge")
 local Save = require("savesnap")
 local Streaming = require("streaming")
-
 local TICK_MS = 300
 local LEARN_INTERVAL_S = 30
 
@@ -35,8 +34,23 @@ local function tickChallenge()
     end
 end
 
+local Toast = require("toast")
+
+-- A new world or player controller frees the old widgets; forget them before anything touches them.
+local worldKey = nil
+local function forgetStaleWidgets()
+    local key = U.worldName() .. "|" .. tostring(U.address(U.playerController()))
+    if key == worldKey then return end
+    if worldKey then U.log("world changed, dropping widget references") end
+    worldKey = key
+    BellUI.reset()
+    Toast.reset()
+    Streaming.forget()
+end
+
 LoopAsync(TICK_MS, function()
     U.gameThread("tick", function()
+        forgetStaleWidgets()
         if Challenge.phase() == "reloading" and BellUI.menuOpen() then Challenge.onBellMenuOpen() end
         BellUI.tick(not Challenge.isActive())
         tickChallenge()
@@ -80,6 +94,8 @@ NotifyOnNewObject("/Script/UMG.UserWidget", function(widget)
 end)
 
 RegisterLoadMapPostHook(function()
+    BellUI.reset()
+    Toast.reset()
     U.gameThread("onMapLoaded", function() Challenge.onMapLoaded() end)
     lastLearnAt = os.time() - LEARN_INTERVAL_S + 10
 end)

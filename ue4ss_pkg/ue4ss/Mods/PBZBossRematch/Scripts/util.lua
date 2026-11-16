@@ -59,6 +59,16 @@ function M.address(obj)
     return ok and a or nil
 end
 
+-- Lua wrappers must not be kept across frames: once the engine frees the object, touching the
+-- wrapper (even IsValid) can crash UE4SS. Keep the address and look the object up again here.
+function M.live(className, addr)
+    if not addr then return nil end
+    for _, o in ipairs(FindAllOf(className) or {}) do
+        if M.address(o) == addr then return o end
+    end
+    return nil
+end
+
 function M.location(actor)
     local ok, loc = pcall(function() return actor:K2_GetActorLocation() end)
     if ok and loc then return { X = loc.X, Y = loc.Y, Z = loc.Z } end

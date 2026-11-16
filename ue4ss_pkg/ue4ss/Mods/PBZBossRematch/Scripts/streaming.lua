@@ -80,6 +80,11 @@ function M.idle()
     return true
 end
 
+-- The world it lived in is gone; drop the reference without touching the freed actor.
+function M.forget()
+    source = nil
+end
+
 function M.clear()
     if not source then return end
     pcall(function() source.comp:DisableStreamingSource() end)
