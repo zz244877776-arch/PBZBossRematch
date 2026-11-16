@@ -8,7 +8,7 @@
 
 不需要 Python 或任何开发环境：
 
-1. 到 [Releases](https://github.com/zz244877776-arch/PBZBossRematch/releases) 下载最新的 `PBZBossRematch-*.zip`
+1. 到 [Releases](https://github.com/zz244877776-arch/PBZBossRematch/releases) 或 [Nexus Mods](https://www.nexusmods.com/games/phantombladezero/mods/1132) 下载最新的 `PBZBossRematch-*.zip`
 2. 解压后双击 `安装宿敌再战Mod.bat`
 3. 在弹出的窗口里选择游戏目录（或游戏 exe），点安装
 

@@ -563,7 +563,7 @@ local function arrayItems(arr)
 end
 
 -- Combat music sticks to the last engaged enemy. Rematch jumps between bosses without the game's
--- normal disengage, so the previous fight's track can keep playing until we set a new state.
+-- normal disengage, so the previous fight's track can keep playing until we clear and set a new state.
 clearStickyCombatMusic = function()
     local music = U.worldSubsystem("MusicSubsystem")
     if not music then return end
@@ -581,10 +581,9 @@ applyStageMusic = function(stage)
         U.log("stage music: no music subsystem")
         return
     end
-    -- Drop sticky combat from the last rematch before forcing this boss's state.
     pcall(function() music:ClearMusic(0.35, true, false) end)
     local wanted = compact(string.gsub(stage.id, "^BP_Monster_", ""))
-    local best, bestLen, bestName, bestVol = nil, -1, nil, nil
+    local best, bestLen, bestName = nil, -1, nil
     for _, vol in ipairs(FindAllOf("PBZMusicVolume") or {}) do
         local loc = U.location(vol)
         if loc and U.dist(loc, center) <= MUSIC_VOLUME_RADIUS then
@@ -598,7 +597,7 @@ applyStageMusic = function(stage)
                 if key ~= "" and (string.find(wanted, key, 1, true) or string.find(key, wanted, 1, true)) then
                     local state = states[i]
                     if U.valid(state) and #key > bestLen then
-                        best, bestLen, bestName, bestVol = state, #key, name, vol
+                        best, bestLen, bestName = state, #key, name
                     end
                 end
             end
