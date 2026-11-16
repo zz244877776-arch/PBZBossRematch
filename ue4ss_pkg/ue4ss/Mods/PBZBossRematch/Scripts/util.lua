@@ -81,6 +81,25 @@ function M.dist(a, b)
     return math.sqrt(dx * dx + dy * dy + dz * dz)
 end
 
+-- World-Partition / soft actors sometimes report Z in the millions. Teleporting there
+-- drops the player through the void (seen on 悲泣溪谷龙柱 / 暗魔天堡, 血色森林, etc.).
+-- Valid arenas seen up to ~±20k (e.g. 新娘阿花 cave). Bell_NLES_001 at Z≈-32510 is void and kills.
+M.MAX_SANE_ABS_Z = 28000
+
+function M.saneWorldLoc(loc)
+    if not loc then return false end
+    local z = loc.Z
+    if z == nil then z = loc.z end
+    if type(z) ~= "number" then return false end
+    return math.abs(z) < M.MAX_SANE_ABS_Z
+end
+
+function M.horizDist(a, b)
+    if not a or not b then return math.huge end
+    local dx, dy = a.X - b.X, a.Y - b.Y
+    return math.sqrt(dx * dx + dy * dy)
+end
+
 function M.readFile(path)
     local f = io.open(path, "rb")
     if not f then return nil end
@@ -186,6 +205,21 @@ function M.transformTable(t)
         Translation = { X = t.Translation.X, Y = t.Translation.Y, Z = t.Translation.Z },
         Scale3D = { X = 1.0, Y = 1.0, Z = 1.0 },
     }
+end
+
+-- Prefer TeleportTransform when its Z is sane; otherwise fall back to BellLocation.
+function M.bellTravelTransform(bell)
+    if not bell then return nil end
+    local t = bell.transform
+    if t and M.saneWorldLoc(t.Translation) then return t end
+    if M.saneWorldLoc(bell.loc) then
+        return {
+            Rotation = (t and t.Rotation) or { X = 0.0, Y = 0.0, Z = 0.0, W = 1.0 },
+            Translation = { X = bell.loc.X, Y = bell.loc.Y, Z = bell.loc.Z },
+            Scale3D = { X = 1.0, Y = 1.0, Z = 1.0 },
+        }
+    end
+    return t
 end
 
 function M.gameThread(name, fn)

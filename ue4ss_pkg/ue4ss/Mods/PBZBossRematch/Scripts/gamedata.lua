@@ -10,6 +10,25 @@ local bossRows = nil
 local bellRows = nil
 local arenaCache = U.loadTable(ARENA_CACHE_PATH) or {}
 
+-- Drop sky/void coordinates learned from unloaded World-Partition actors so rematch
+-- never teleports the player to Z≈2e6 / 1e7 (instant fall death).
+local function sanitizeArenaCache()
+    local changed = 0
+    for id, a in pairs(arenaCache) do
+        if a and a.z ~= nil and not U.saneWorldLoc({ X = a.x or 0, Y = a.y or 0, Z = a.z }) then
+            U.log("arena cache: clearing sky coords for %s (z=%s)", id, tostring(a.z))
+            a.x, a.y, a.z = nil, nil, nil
+            a.skyInvalid = true
+            changed = changed + 1
+        end
+    end
+    if changed > 0 then
+        U.saveTable(ARENA_CACHE_PATH, arenaCache)
+        U.log("arena cache: cleared %d sky entr(y/ies)", changed)
+    end
+end
+sanitizeArenaCache()
+
 local function rowStructName(dt)
     local ok, n = pcall(function() return dt.RowStruct:GetFName():ToString() end)
     return ok and n or ""
@@ -135,9 +154,10 @@ end
 
 function M.nearestBell(mapId, loc)
     local best, bestDist = nil, math.huge
+    local useHoriz = loc and not U.saneWorldLoc(loc)
     for _, b in ipairs(M.bells()) do
-        if b.map == mapId and b.type == BELL_TYPE_MELODIOUS then
-            local d = U.dist(b.loc, loc)
+        if b.map == mapId and b.type == BELL_TYPE_MELODIOUS and U.saneWorldLoc(b.loc) then
+            local d = useHoriz and U.horizDist(b.loc, loc) or U.dist(b.loc, loc)
             if d < bestDist then best, bestDist = b, d end
         end
     end
@@ -243,6 +263,37 @@ function M.levelNameForBell(bellId)
         if s ~= "" and s ~= "None" then return s end
     end
     return nil
+end
+
+function M.levelNameForMap(mapId)
+    for _, b in ipairs(M.bellsInMap(mapId)) do
+        local lv = M.levelNameForBell(b.id)
+        if lv then return lv end
+    end
+    return nil
+end
+
+-- Spawner must sit near a bell that belongs to the boss's own map; otherwise we learned
+-- a same-class actor from a different region (seen with 阿瑾 caching 陆家村 coords).
+M.MAX_ARENA_BELL_DIST = 80000
+
+function M.arenaBelongsToBossMap(arena, bossMap)
+    if not arena or arena.unsupported then return false end
+    if arena.bell and arena.bell ~= "" then
+        local b = M.bellById(arena.bell)
+        if b and b.map ~= bossMap then return false end
+        local mapLevel = M.levelNameForMap(bossMap)
+        local bellLevel = M.levelNameForBell(arena.bell)
+        if mapLevel and bellLevel and mapLevel ~= bellLevel then return false end
+    end
+    if arena.x and arena.bell and arena.bell ~= "" then
+        local b = M.bellById(arena.bell)
+        if b and U.saneWorldLoc(b.loc) then
+            local d = U.dist(b.loc, { X = arena.x, Y = arena.y, Z = arena.z })
+            if d > M.MAX_ARENA_BELL_DIST then return false end
+        end
+    end
+    return true
 end
 
 -- ===== Boss spawners =====
@@ -427,23 +478,49 @@ function M.learnArenas()
     end
     -- A boss can have several spawners (story and rematch versions); keep the cached one if it is still among them.
     for id, c in pairs(candidates) do
+        local b = c.boss
         local prev = arenaCache[id]
         local keep = false
-        if prev and not prev.unsupported and prev.x then
+        if prev and M.arenaBelongsToBossMap(prev, b.map) and prev.x
+            and U.saneWorldLoc({ X = prev.x, Y = prev.y, Z = prev.z }) then
             for _, cand in ipairs(c.list) do
-                if U.dist(cand.loc, { X = prev.x, Y = prev.y, Z = prev.z }) < 500 then keep = true end
+                if U.saneWorldLoc(cand.loc) and U.dist(cand.loc, { X = prev.x, Y = prev.y, Z = prev.z }) < 500 then
+                    keep = true
+                end
             end
         end
         if not keep then
-            local b, s, loc = c.boss, c.list[1].spawner, c.list[1].loc
-            local bell = M.nearestBell(b.map, loc)
-            learned = learned + 1
-            arenaCache[b.id] = {
-                map = b.map,
-                x = math.floor(loc.X), y = math.floor(loc.Y), z = math.floor(loc.Z),
-                bell = bell and bell.id or "",
-                spawnerId = U.str(s.SpawnerID),
-            }
+            local pick, pickBell, pickDist = nil, nil, math.huge
+            for _, cand in ipairs(c.list) do
+                if U.saneWorldLoc(cand.loc) then
+                    local bell, d = M.nearestBell(b.map, cand.loc)
+                    if bell and d < pickDist and d <= M.MAX_ARENA_BELL_DIST then
+                        pick, pickBell, pickDist = cand, bell, d
+                    end
+                end
+            end
+            if not pick then
+                local any = c.list[1]
+                -- Keep map hint only; never bind a far-away / sky spawner to this boss.
+                arenaCache[b.id] = {
+                    map = b.map,
+                    bell = "",
+                    spawnerId = any and U.str(any.spawner.SpawnerID) or "",
+                    skyInvalid = not (any and U.saneWorldLoc(any.loc)),
+                    farFromMap = true,
+                }
+                learned = learned + 1
+                U.log("arena learn skipped off-map/sky loc for %s", b.id)
+            else
+                local s, loc = pick.spawner, pick.loc
+                learned = learned + 1
+                arenaCache[b.id] = {
+                    map = b.map,
+                    x = math.floor(loc.X), y = math.floor(loc.Y), z = math.floor(loc.Z),
+                    bell = pickBell and pickBell.id or "",
+                    spawnerId = U.str(s.SpawnerID),
+                }
+            end
         end
     end
     if learned > 0 then

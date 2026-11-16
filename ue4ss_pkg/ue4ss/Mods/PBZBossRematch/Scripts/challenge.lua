@@ -90,13 +90,34 @@ local function localTeleport(transform)
     return true
 end
 
+local setPlayerTransitFrozen -- defined after setFrozen (local forward ref)
+local dismissEarlyNextStage -- defined later; used from tickSpawning
+
 local function travel(level, transform, bellId)
-    st.travel = { level = level, loc = transform.Translation, bell = bellId }
+    local bell = Data.bellById(bellId)
+    local xf = transform
+    -- Same-map hops may pass an approach transform; cross-map always prefers a sane bell point.
+    if not inLevel(level) then
+        xf = (bell and U.bellTravelTransform(bell)) or transform
+        if not U.saneWorldLoc(xf and xf.Translation) and U.saneWorldLoc(transform and transform.Translation) then
+            xf = transform
+        end
+    elseif not U.saneWorldLoc(xf and xf.Translation) then
+        xf = (bell and U.bellTravelTransform(bell)) or xf
+    end
+    if not U.saneWorldLoc(xf and xf.Translation) then
+        U.log("travel refused: destination Z is not sane (%.0f, %.0f, %.0f)",
+            xf and xf.Translation.X or 0, xf and xf.Translation.Y or 0, xf and xf.Translation.Z or 0)
+        return false, "目标点坐标异常（可能摔死），已取消传送"
+    end
+
+    st.travel = { level = level, loc = xf.Translation, bell = bellId }
     local same = inLevel(level)
     U.log("travel level=%s bell=%s sameMap=%s at (%.0f, %.0f, %.0f)", level, bellId, tostring(same),
-        transform.Translation.X, transform.Translation.Y, transform.Translation.Z)
+        xf.Translation.X, xf.Translation.Y, xf.Translation.Z)
+    if Config.LoadingCurtain ~= false then setPlayerTransitFrozen(true) end
     if same then
-        local ok, err = localTeleport(transform)
+        local ok, err = localTeleport(xf)
         if not ok then
             U.log("local move failed: %s", tostring(err))
             local here = U.location(U.playerPawn())
@@ -108,8 +129,6 @@ local function travel(level, transform, bellId)
         return true
     end
     -- Cross-map travel has to land on the bell itself. A point in an unloaded cell hangs TeleportTo.
-    local bell = Data.bellById(bellId)
-    local xf = (bell and bell.transform) or transform
     st.travel.loc = xf.Translation
     local sub = saveSub()
     if not sub then return false, "找不到存档子系统" end
@@ -209,6 +228,41 @@ local function setFrozen(pawn, frozen)
     end
 end
 
+setPlayerTransitFrozen = function(frozen)
+    local pawn = U.playerPawn()
+    if frozen then
+        if not U.valid(pawn) then return end
+        st.playerFreezeKey = U.address(pawn)
+        st.playerFreezeClass = U.className(pawn)
+        setFrozen(pawn, true)
+        -- FreezeCharacter alone does not stop void fall / kill volumes.
+        pcall(function()
+            local move = pawn.CharacterMovement
+            if U.valid(move) then
+                if st.savedGravity == nil then st.savedGravity = move.GravityScale end
+                move.GravityScale = 0
+                pcall(function() move:StopMovementImmediately() end)
+                pcall(function() move:SetMovementMode(0) end) -- MOVE_None
+            end
+        end)
+        return
+    end
+    if st.playerFreezeKey then
+        local p = U.live(st.playerFreezeClass, st.playerFreezeKey)
+        if p then
+            setFrozen(p, false)
+            pcall(function()
+                local move = p.CharacterMovement
+                if U.valid(move) then
+                    if st.savedGravity ~= nil then move.GravityScale = st.savedGravity end
+                    pcall(function() move:SetMovementMode(1) end) -- MOVE_Walking
+                end
+            end)
+        end
+        st.playerFreezeKey, st.playerFreezeClass, st.savedGravity = nil, nil, nil
+    end
+end
+
 local function unfreezeBoss()
     if st.frozenKey then
         local p = U.live(st.frozenClass, st.frozenKey)
@@ -223,6 +277,7 @@ local function returnToStart(reason, delayMs)
     st.endReason = reason
     setPhase("ending")
     unfreezeBoss()
+    setPlayerTransitFrozen(false)
     Curtain.reveal(0.3)
     Streaming.clear()
     clearStickyCombatMusic()
@@ -276,11 +331,38 @@ function M.start(boss)
     U.log("=== start challenge: %s (%s, map %s)", boss.name, boss.id, boss.map)
 
     local mapBells = Data.bellsInMap(boss.map)
+    local function firstSaneMapBell()
+        for _, b in ipairs(mapBells) do
+            local t = U.bellTravelTransform(b)
+            if t and U.saneWorldLoc(t.Translation) then return b end
+        end
+        return mapBells[1]
+    end
+    if arena and not Data.arenaBelongsToBossMap(arena, boss.map) then
+        U.log("arena cache for %s is off-map/mismatched; ignoring cached bell/xyz", boss.id)
+        arena = { map = boss.map }
+    end
     local arenaBell = arena and arena.bell and arena.bell ~= "" and Data.bellById(arena.bell) or nil
-    local firstBell = arenaBell or mapBells[1]
+    if arenaBell then
+        local t = U.bellTravelTransform(arenaBell)
+        if not (t and U.saneWorldLoc(t.Translation)) then
+            U.log("arena bell %s travel point not sane; falling back to map bell", arenaBell.id)
+            arenaBell = nil
+        end
+    end
+    local firstBell = arenaBell or firstSaneMapBell()
     if not firstBell then
         Toast.show("找不到前往该地图的铃铛", 4000)
         return
+    end
+    local mapLevel = Data.levelNameForMap(boss.map)
+    local level = Data.levelNameForBell(firstBell.id)
+    if mapLevel and level and mapLevel ~= level then
+        U.log("bell %s level %s != map %s level %s; using map bell instead",
+            firstBell.id, tostring(level), boss.map, tostring(mapLevel))
+        arenaBell = nil
+        firstBell = firstSaneMapBell()
+        level = firstBell and Data.levelNameForBell(firstBell.id) or mapLevel
     end
     if arenaBell then
         U.log("arena cache hit bell=%s at (%.0f, %.0f, %.0f)", arena.bell, arena.x or 0, arena.y or 0, arena.z or 0)
@@ -288,7 +370,6 @@ function M.start(boss)
         U.log("arena cache miss; first visit uses map bell %s (next time will be faster)", firstBell.id)
         Toast.show("首次前往该地图，正在加载……", 3000)
     end
-    local level = Data.levelNameForBell(firstBell.id)
     if not level then
         Toast.show("找不到铃铛所在关卡", 4000)
         return
@@ -309,13 +390,17 @@ function M.start(boss)
     clearStickyCombatMusic()
     if Config.LoadingCurtain ~= false then Curtain.cover() end
 
-    local transform = firstBell.transform
-    -- Only step straight to the boss when this map is already loaded. Otherwise fast-travel
-    -- to its bell, and the later hop runs once that move is a same-map teleport.
+    local transform = U.bellTravelTransform(firstBell) or firstBell.transform
+    -- Only step straight to the boss when this map is already loaded and the cached
+    -- arena XYZ is on solid ground. Sky/void cache (Z≈2e6+) must never be used.
     if arenaBell and arena.x and inLevel(level) then
         local arenaLoc = { X = arena.x, Y = arena.y, Z = arena.z }
-        transform = approachTransform(arenaLoc, arenaBell.loc, APPROACH_DISTANCE)
-        st.finalHop = true
+        if U.saneWorldLoc(arenaLoc) then
+            transform = approachTransform(arenaLoc, arenaBell.loc, APPROACH_DISTANCE)
+            st.finalHop = true
+        else
+            U.log("arena cache XYZ not sane for %s; traveling to bell only", boss.id)
+        end
     end
 
     local tok, terr = travel(level, transform, firstBell.id)
@@ -331,15 +416,20 @@ local function arrived()
     local pawn = U.playerPawn()
     if not pawn then return false end
     if not string.find(U.worldName(), st.travel.level, 1, true) then return false end
-    return U.dist(U.location(pawn), st.travel.loc) < ARRIVAL_RADIUS
+    local here = U.location(pawn)
+    if not here or not U.saneWorldLoc(here) then return false end
+    return U.dist(here, st.travel.loc) < ARRIVAL_RADIUS
 end
 
 local function tickTraveling()
     if elapsed() > TRAVEL_TIMEOUT_S then return abort("传送超时") end
+    if Config.LoadingCurtain ~= false then setPlayerTransitFrozen(true) end
     if not arrived() then
         st.arrivedAt = nil
         return
     end
+    -- Wait for collision/streaming under the feet before we unfreeze / hop again.
+    if not Streaming.idle() and elapsed() < TRAVEL_TIMEOUT_S then return end
     st.arrivedAt = st.arrivedAt or os.time()
     if os.time() - st.arrivedAt < SETTLE_AFTER_ARRIVAL_S then return end
     setPhase("locating")
@@ -463,25 +553,8 @@ local function activateEncounterSupport(center, mainSpawner)
         end
     end
 
-    for _, seq in ipairs(FindAllOf("LevelSequenceActor") or {}) do
-        if U.valid(seq) then
-            local loc = U.location(seq)
-            if loc and U.dist(loc, center) <= 12000 then
-                local played = pcall(function() seq:Play() end)
-                if not played then
-                    played = pcall(function()
-                        local player = seq.SequencePlayer
-                        if player then player:Play() end
-                    end)
-                end
-                if played then
-                    activated = activated + 1
-                    U.log("played LevelSequenceActor %s", U.fullName(seq))
-                end
-            end
-        end
-    end
-
+    -- Do NOT Play nearby LevelSequenceActors here. That starts the story fight early
+    -- (countdown skipped, boss dragged outside the arena) — seen with 火流星.
     U.log("encounter support activated=%d prefix=%s", activated, tostring(prefix))
 end
 
@@ -571,13 +644,19 @@ clearStickyCombatMusic = function()
     U.log("refreshed gameplay music (no ClearMusic)")
 end
 
--- Score a name match against the stage id. Prefer keys that end farther into the id so
--- "LionDancer_P2" picks "P2" (WuShi_P2) over the longer prefix "LionDancer" (WuShi_P1).
+-- Score a name match against the stage id.
+-- Exact / key-inside-wanted beats wanted-inside-key, so phase-1 "GuiChai_Red" does not
+-- pick the longer "GuiChai_Red_P2" entry. Phase-2 ids still prefer their own P2 key.
 local function musicMatchScore(wanted, key)
+    if key == "" or wanted == "" then return nil end
+    if key == wanted then return 2000000 + #key end
     local i, j = string.find(wanted, key, 1, true)
-    if i then return j * 1000 + #key end
+    if i then
+        -- Prefer keys that cover the end of wanted (…_P2 matches P2 at the end).
+        return 1000000 + j * 1000 + #key
+    end
     i, j = string.find(key, wanted, 1, true)
-    if i then return #wanted * 1000 + #key end
+    if i then return 1000 + #wanted end
     return nil
 end
 
@@ -661,6 +740,13 @@ local function onSpawnerFound(spawner)
     Data.learnArenas()
     local spawnerLoc = U.location(spawner)
     local pawnLoc = U.location(U.playerPawn())
+    -- Soft/unloaded actors can report Z in the millions; do not teleport there.
+    if not U.saneWorldLoc(spawnerLoc) then
+        U.log("spawner loc not sane (%.0f, %.0f, %.0f); spawning without hop",
+            spawnerLoc and spawnerLoc.X or 0, spawnerLoc and spawnerLoc.Y or 0, spawnerLoc and spawnerLoc.Z or 0)
+        Streaming.clear()
+        return startSpawn(spawner)
+    end
     if st.finalHop or U.dist(spawnerLoc, pawnLoc) <= NEAR_BOSS_RADIUS then
         Streaming.clear()
         return startSpawn(spawner)
@@ -681,6 +767,10 @@ local function hopToCachedArena()
     local arena = Data.arena(st.boss.id)
     if not arena or arena.unsupported or not arena.x then return false end
     local arenaLoc = { X = arena.x, Y = arena.y, Z = arena.z }
+    if not U.saneWorldLoc(arenaLoc) then
+        U.log("skip hopToCachedArena: sky coords z=%s", tostring(arena.z))
+        return false
+    end
     local pawnLoc = U.location(U.playerPawn())
     if not pawnLoc then return false end
     if U.dist(pawnLoc, arenaLoc) <= NEAR_BOSS_RADIUS then
@@ -689,6 +779,10 @@ local function hopToCachedArena()
     end
     local bell = (arena.bell ~= "" and Data.bellById(arena.bell)) or Data.nearestBell(st.boss.map, arenaLoc)
     local transform = approachTransform(arenaLoc, (bell and bell.loc) or pawnLoc, APPROACH_DISTANCE)
+    if not U.saneWorldLoc(transform.Translation) then
+        U.log("skip hopToCachedArena: approach transform not sane")
+        return false
+    end
     st.finalHop = true
     U.log("cached arena %.0f away, jumping next to it", U.dist(pawnLoc, arenaLoc))
     local ok, err = travel(st.level, transform, bell and bell.id or st.travel.bell)
@@ -773,7 +867,8 @@ end
 
 local function placePlayerNearBoss()
     local pawn = U.playerPawn()
-    local bossLoc = st.spawnerLoc or U.location(bossPawn())
+    local boss = bossPawn()
+    local bossLoc = U.location(boss) or st.spawnerLoc
     local p = U.location(pawn)
     if not pawn or not bossLoc or not p then return end
     if U.dist(p, bossLoc) <= NEAR_BOSS_DISTANCES[#NEAR_BOSS_DISTANCES] then return end
@@ -790,6 +885,25 @@ local function placePlayerNearBoss()
     U.log("could not place player near boss")
 end
 
+-- If the encounter sequence left the boss outside the fight volume, pull it next to the player.
+local function pullBossToPlayer()
+    local pawn = U.playerPawn()
+    local boss = bossPawn()
+    local p = U.location(pawn)
+    local b = U.location(boss)
+    if not U.valid(boss) or not p or not b then return end
+    if U.dist(p, b) <= NEAR_BOSS_DISTANCES[#NEAR_BOSS_DISTANCES] then return end
+    local xf, yaw = approachTransform(p, b, APPROACH_DISTANCE)
+    -- approachTransform(target=player, from=boss) puts a point near the player; teleport the boss there.
+    local rot = { Pitch = 0.0, Yaw = yaw + 180.0, Roll = 0.0 }
+    local ok, moved = pcall(function() return boss:K2_TeleportTo(xf.Translation, rot) end)
+    U.log("pull boss to player ok=%s moved=%s distWas=%.0f", tostring(ok), tostring(moved), U.dist(p, b))
+    if ok and moved then
+        st.spawnerLoc = xf.Translation
+        setFrozen(boss, true)
+    end
+end
+
 local function tickSpawning()
     local spawner = U.live(st.spawnerClass, st.spawnerKey)
     local ai = nil
@@ -797,6 +911,8 @@ local function tickSpawning()
     if U.valid(ai) and not isDead(ai) then
         setBoss(ai)
         placePlayerNearBoss()
+        pullBossToPlayer()
+        dismissEarlyNextStage()
         if st.rootBoss and not Curtain.isCovered() then
             setPhase("fighting")
             Toast.show("下一阶段开战：" .. st.boss.name, 3000)
@@ -818,7 +934,7 @@ end
 
 -- A level sequence started for the encounter can bring the next phase in early; it must only
 -- appear once the current phase is down.
-local function dismissEarlyNextStage()
+dismissEarlyNextStage = function()
     local nxt = nextStageOf(st.boss)
     if not nxt then return end
     for _, a in ipairs(FindAllOf(nxt.class) or {}) do
@@ -841,7 +957,9 @@ local function dismissEarlyNextStage()
 end
 
 local function beginFight()
+    if st.phase ~= "countdown" then return end
     dismissEarlyNextStage()
+    pullBossToPlayer()
     unfreezeBoss()
     setPhase("fighting")
     Toast.show("开战：" .. st.boss.name, 2000)
@@ -878,6 +996,7 @@ local function tickPreparing()
     if not ready and elapsed() < PREPARE_TIMEOUT_S then return end
     U.log("arena ready after %ds (streaming idle=%s)", elapsed(), tostring(Streaming.idle()))
     dismissEarlyNextStage()
+    setPlayerTransitFrozen(false)
     Curtain.reveal(REVEAL_FADE_S)
     startCountdown()
 end
@@ -885,6 +1004,8 @@ end
 local function tickCountdown()
     local boss = bossPawn()
     if boss then setFrozen(boss, true) end
+    -- Sequence leftovers of the next phase must stay gone for the whole countdown.
+    dismissEarlyNextStage()
 end
 
 -- Rematch skips some story LevelSequences / AIScripts that normally push「斩」.
