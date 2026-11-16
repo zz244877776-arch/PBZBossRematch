@@ -68,9 +68,10 @@ $chkBackup.Size = New-Object System.Drawing.Size(660, 22)
 $chkBackup.Checked = $true
 $form.Controls.Add($chkBackup)
 
-$btnInstall = New-Button '安装 / 更新' 22 238 150
-$btnUninstall = New-Button '卸载' 182 238 110
-$btnDoc = New-Button '打开使用说明' 302 238 130
+$btnInstall = New-Button '安装 / 更新' 22 238 140
+$btnUninstall = New-Button '卸载' 172 238 90
+$btnDoc = New-Button '打开使用说明' 272 238 120
+$btnDocEn = New-Button 'English Guide' 402 238 120
 $btnInstall.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9, [System.Drawing.FontStyle]::Bold)
 
 $logBox = New-Object System.Windows.Forms.TextBox
@@ -184,6 +185,13 @@ $btnUninstall.Add_Click({
 $btnDoc.Add_Click({
     $doc = Join-Path $Payload $DocName
     if (Test-Path -LiteralPath $doc) { Start-Process -FilePath 'notepad.exe' -ArgumentList "`"$doc`"" }
+})
+
+$btnDocEn.Add_Click({
+    $doc = Join-Path $Payload $DocNameEn
+    if (-not (Test-Path -LiteralPath $doc)) { $doc = Join-Path $PackageRoot $DocNameEn }
+    if (Test-Path -LiteralPath $doc) { Start-Process -FilePath 'notepad.exe' -ArgumentList "`"$doc`"" }
+    else { & $log "English guide not found: $DocNameEn" }
 })
 
 $form.Add_Shown({

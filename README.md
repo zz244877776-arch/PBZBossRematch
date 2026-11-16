@@ -2,7 +2,7 @@
 
 基于 UE4SS Lua 的本地 mod：在铃铛菜单里加入「宿敌再战」入口，可重新挑战已击败的 Boss。挑战是临时的，结束（胜利、失败或按 Home 退出）后自动还原存档并回到出发的铃铛，进度不变。
 
-详细说明见 [docs/使用说明.md](docs/使用说明.md)。
+详细说明见 [docs/使用说明.md](docs/使用说明.md) · English: [docs/Usage.en.md](docs/Usage.en.md)。
 
 ## 下载安装（玩家）
 

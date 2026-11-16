@@ -7,6 +7,8 @@ MOD_SRC = WORK / "ue4ss_pkg" / "ue4ss" / "Mods" / "PBZBossRematch" / "Scripts"
 INSTALLER_SRC = WORK / "installer_src"
 DOC_SRC = WORK / "docs" / "使用说明.md"
 DOC_NAME = "宿敌再战Mod_使用说明.md"
+DOC_EN_SRC = WORK / "docs" / "Usage.en.md"
+DOC_EN_NAME = "PBZBossRematch_Usage_EN.md"
 
 PKG_NAME = "宿敌再战Mod安装包"
 DIST = WORK / "dist"
@@ -76,6 +78,14 @@ def main():
     doc = player.rstrip() + "\n"
     (PAYLOAD / DOC_NAME).write_text(doc, encoding="utf-8")
     (OUT / DOC_NAME).write_text(doc, encoding="utf-8")
+
+    doc_en = DOC_EN_SRC.read_text(encoding="utf-8").replace("\r\n", "\n").replace("\r", "\n")
+    en_player, en_appendix, _en_rest = doc_en.partition("\n---\n\n## Appendix:")
+    if not en_appendix:
+        raise SystemExit("English doc is missing the appendix marker, package not built")
+    doc_en = en_player.rstrip() + "\n"
+    (PAYLOAD / DOC_EN_NAME).write_text(doc_en, encoding="utf-8")
+    (OUT / DOC_EN_NAME).write_text(doc_en, encoding="utf-8")
 
     inst = OUT / "installer"
     inst.mkdir()

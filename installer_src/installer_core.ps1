@@ -4,6 +4,7 @@ $PackageRoot = Split-Path -Parent $PSScriptRoot
 $Payload = Join-Path $PackageRoot 'payload'
 $ModName = 'PBZBossRematch'
 $DocName = '宿敌再战Mod_使用说明.md'
+$DocNameEn = 'PBZBossRematch_Usage_EN.md'
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
 # ---------------- 路径识别 ----------------
@@ -188,6 +189,11 @@ function Install-Mod([string]$root, [bool]$installUe4ss, [bool]$backupSaves, [sc
     if (Test-Path -LiteralPath $doc) {
         Copy-Item -LiteralPath $doc -Destination (Join-Path $root $DocName) -Force
         & $log "使用说明已复制到游戏目录：$DocName"
+    }
+    $docEn = Join-Path $Payload $DocNameEn
+    if (Test-Path -LiteralPath $docEn) {
+        Copy-Item -LiteralPath $docEn -Destination (Join-Path $root $DocNameEn) -Force
+        & $log "English guide copied: $DocNameEn"
     }
     & $log "安装完成。启动游戏后，在铃铛菜单中即可看到“宿敌再战”。"
 }
