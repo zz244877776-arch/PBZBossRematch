@@ -799,7 +799,7 @@ local function tickSpawning()
         placePlayerNearBoss()
         if st.rootBoss and not Curtain.isCovered() then
             setPhase("fighting")
-            Toast.show("下一阶段：" .. st.boss.name, 3000)
+            Toast.show("下一阶段开战：" .. st.boss.name, 3000)
             return
         end
         st.frozenKey, st.frozenClass = st.bossKey, st.bossClass
@@ -887,7 +887,197 @@ local function tickCountdown()
     if boss then setFrozen(boss, true) end
 end
 
+-- Rematch skips some story LevelSequences / AIScripts that normally push「斩」.
+-- Force the same UI the game uses: BP_GameplayHelper.Push BossDeadUI.
+local BOSS_DEAD_CLASS_PATH = "/Game/PBZContent/UI/InGame/Dead/W_BossDead.W_BossDead_C"
+local BOSS_DEAD_RED_CLASS_PATH = "/Game/PBZContent/UI/InGame/Dead/W_BossDead_Red.W_BossDead_Red_C"
+local GAMEPLAY_HELPER_CDO = "/Game/PBZContent/Blueprint/BP_GameplayHelper.Default__BP_GameplayHelper_C"
+local PUSH_BOSS_DEAD_FN = "/Game/PBZContent/Blueprint/BP_GameplayHelper.BP_GameplayHelper_C:Push BossDeadUI"
+local BOSS_DEAD_WIDGET_CLASSES = { "W_BossDead_C", "W_BossDead_Red_C", "W_BossDeadRed_C" }
+
+local cachedBossDeadClass = nil
+local cachedBossDeadRedClass = nil
+local cachedGameplayHelper = nil
+
+function M.cacheBossDeadWidget(widget)
+    if not U.valid(widget) then return end
+    local ok, cls = pcall(function() return widget:GetClass() end)
+    if not (ok and U.valid(cls)) then return end
+    local name = U.className(widget)
+    if name == "W_BossDead_Red_C" or name == "W_BossDeadRed_C" then
+        cachedBossDeadRedClass = cls
+    else
+        cachedBossDeadClass = cls
+    end
+    U.log("cached %s class: %s", name, U.fullName(cls))
+end
+
+local function findGameplayHelper()
+    if U.valid(cachedGameplayHelper) then return cachedGameplayHelper end
+    local tries = {
+        function() return StaticFindObject(GAMEPLAY_HELPER_CDO) end,
+        function() return FindFirstOf("BP_GameplayHelper_C") end,
+        function() return FindObject("BlueprintFunctionLibrary", "Default__BP_GameplayHelper_C") end,
+        function() return FindObject(nil, "Default__BP_GameplayHelper_C") end,
+    }
+    for _, fn in ipairs(tries) do
+        local ok, obj = pcall(fn)
+        if ok and U.valid(obj) then
+            cachedGameplayHelper = obj
+            U.log("found BP_GameplayHelper: %s", U.fullName(obj))
+            return obj
+        end
+    end
+    return nil
+end
+
+local function clearBossDeadWidgets()
+    local n = 0
+    for _, cls in ipairs(BOSS_DEAD_WIDGET_CLASSES) do
+        for _, w in ipairs(FindAllOf(cls) or {}) do
+            if U.valid(w) then
+                pcall(function() w:DeactivateWidget() end)
+                pcall(function() w:RemoveFromParent() end)
+                n = n + 1
+            end
+        end
+    end
+    if n > 0 then U.log("cleared %d leftover BossDead widget(s)", n) end
+end
+
+local function resolveBossDeadClass(useRed)
+    if useRed and U.valid(cachedBossDeadRedClass) then return cachedBossDeadRedClass end
+    if not useRed and U.valid(cachedBossDeadClass) then return cachedBossDeadClass end
+    local path = useRed and BOSS_DEAD_RED_CLASS_PATH or BOSS_DEAD_CLASS_PATH
+    local ok, cls = pcall(function() return StaticFindObject(path) end)
+    if ok and U.valid(cls) then
+        if useRed then cachedBossDeadRedClass = cls else cachedBossDeadClass = cls end
+        return cls
+    end
+    local short = useRed and "W_BossDead_Red_C" or "W_BossDead_C"
+    ok, cls = pcall(function() return FindObject("WidgetBlueprintGeneratedClass", short) end)
+    if ok and U.valid(cls) then
+        if useRed then cachedBossDeadRedClass = cls else cachedBossDeadClass = cls end
+        return cls
+    end
+    for _, w in ipairs(FindAllOf(short) or {}) do
+        if U.valid(w) then
+            local okc, c = pcall(function() return w:GetClass() end)
+            if okc and U.valid(c) then
+                if useRed then cachedBossDeadRedClass = c else cachedBossDeadClass = c end
+                return c
+            end
+        end
+    end
+    if useRed then return resolveBossDeadClass(false) end
+    return nil
+end
+
+local function pushBossDeadViaHelper(useRed)
+    local helper = findGameplayHelper()
+    local ctx = U.playerController() or U.playerPawn()
+    if not U.valid(helper) or not U.valid(ctx) then return false end
+    local red = useRed and true or false
+
+    -- Spaced BP names often aren't exposed as Lua functions; try ProcessEvent first.
+    local okFn, ufn = pcall(function() return StaticFindObject(PUSH_BOSS_DEAD_FN) end)
+    if okFn and U.valid(ufn) then
+        local ok, err = pcall(function()
+            helper:ProcessEvent(ufn, {
+                ["Use BossDead_Red"] = red,
+                Use_BossDead_Red = red,
+                __WorldContext = ctx,
+            })
+        end)
+        if ok then
+            U.log("Push BossDeadUI via ProcessEvent red=%s", tostring(red))
+            return true
+        end
+        U.log("ProcessEvent Push BossDeadUI failed: %s", tostring(err))
+    else
+        U.log("Push BossDeadUI UFunction not found")
+    end
+
+    for _, name in ipairs({ "Push BossDeadUI", "PushBossDeadUI", "Push_BossDeadUI" }) do
+        local ok, err = pcall(function()
+            local f = helper[name]
+            if f == nil then error("nil " .. name) end
+            f(helper, red, ctx)
+        end)
+        if ok then
+            U.log("Push BossDeadUI via index %s red=%s", name, tostring(red))
+            return true
+        end
+        U.log("call %s failed: %s", name, tostring(err))
+    end
+    return false
+end
+
+local function pushBossDeadFallback(useRed)
+    local cls = resolveBossDeadClass(useRed)
+    if not U.valid(cls) then
+        U.log("BossDead fallback: class not loaded yet")
+        return false
+    end
+    local pc = U.playerController()
+    local wbl = StaticFindObject("/Script/UMG.Default__WidgetBlueprintLibrary")
+    if not U.valid(pc) or not U.valid(wbl) then return false end
+    local ok, w = pcall(function() return wbl:Create(pc, cls, pc) end)
+    if not ok or not U.valid(w) then
+        U.log("BossDead fallback create failed: %s", tostring(w))
+        return false
+    end
+    pcall(function() w:SetVisibility(0) end) -- Visible
+    pcall(function() w:AddToViewport(2000) end)
+    pcall(function() w:SetAlignmentInViewport({ X = 0.5, Y = 0.5 }) end)
+    pcall(function()
+        local wll = StaticFindObject("/Script/UMG.Default__WidgetLayoutLibrary")
+        local size = wll:GetViewportSize(pc)
+        w:SetPositionInViewport({ X = size.X * 0.5, Y = size.Y * 0.5 }, true)
+    end)
+    pcall(function() w:ActivateWidget() end)
+    pcall(function() w:BP_OnActivated() end)
+    pcall(function()
+        local ns = w.NS_BossKill
+        if U.valid(ns) then
+            ns:ActivateSystem(true)
+            U.log("NS_BossKill ActivateSystem ok")
+        end
+    end)
+    -- Keep a short-lived reference path only via address lookup later; schedule cleanup.
+    local key = U.address(w)
+    local clsName = U.className(w)
+    U.delay(4500, "challenge.bossDeadClear", function()
+        local live = U.live(clsName, key)
+        if live then
+            pcall(function() live:DeactivateWidget() end)
+            pcall(function() live:RemoveFromParent() end)
+        end
+    end)
+    U.log("BossDead fallback widget pushed (%s)", U.fullName(cls))
+    return true
+end
+
+local function showBossKillBanner(useRed)
+    -- Phase-1 leftovers stay in GUObjectArray even when invisible; always clear then re-push.
+    clearBossDeadWidgets()
+    if pushBossDeadViaHelper(useRed) then
+        -- Helper may push asynchronously; if nothing appeared, fall back.
+        local appeared = false
+        for _, cls in ipairs(BOSS_DEAD_WIDGET_CLASSES) do
+            for _, w in ipairs(FindAllOf(cls) or {}) do
+                if U.valid(w) then appeared = true; break end
+            end
+            if appeared then break end
+        end
+        if appeared then return true end
+        U.log("helper Push reported ok but no W_BossDead yet; using fallback")
+    end
+    return pushBossDeadFallback(useRed)
+end
+
 local function victory()
+    showBossKillBanner(false)
     local name = (st.rootBoss or st.boss).name
     Toast.show("挑战成功：" .. name .. "，即将返回", Config.VictoryReturnDelayMs)
     returnToStart("victory", Config.VictoryReturnDelayMs)
@@ -901,15 +1091,17 @@ local function livePawnOf(boss)
 end
 
 local function enterStage(stage, pawn)
+    clearBossDeadWidgets()
     Curtain.reveal(REVEAL_FADE_S)
     st.boss = stage
     setBoss(pawn)
     st.bossDied = false
     st.playerDied = false
+    st.transitionReminded = nil
     st.musicStage = (st.musicStage or 0) + 1
     setBossFightMusicStage(st.musicStage)
     U.log("stage %s is up", stage.id)
-    Toast.show("下一阶段：" .. stage.name, 3000)
+    Toast.show("下一阶段开战：" .. stage.name, 3000)
     setPhase("fighting")
     applyStageMusic(stage)
 end
@@ -921,6 +1113,11 @@ local function tickTransition()
     local stage = st.nextStage
     local pawn = livePawnOf(stage)
     if pawn then return enterStage(stage, pawn) end
+    -- Slow loads (e.g. 七星阵大师兄 P2) look like a hang; keep reminding the player.
+    if not st.transitionReminded and elapsed() >= STAGE_FADE_AT_S then
+        st.transitionReminded = true
+        Toast.show(string.format("正在加载下一阶段：%s，请稍候…", stage.name), 10000)
+    end
     if elapsed() >= STAGE_FADE_AT_S and Config.LoadingCurtain ~= false then Curtain.fadeOut(STAGE_FADE_S) end
     if elapsed() < STAGE_WAIT_S then return end
     local body = U.live(st.deadClass, st.deadKey)
@@ -935,6 +1132,7 @@ local function tickTransition()
         return victory()
     end
     U.log("spawning next stage %s", stage.id)
+    clearBossDeadWidgets()
     st.rootBoss = st.rootBoss or st.boss
     st.boss = stage
     st.bossDied = false
@@ -949,11 +1147,15 @@ local function tickFighting()
         local nextStage = nextStageOf(st.boss)
         if nextStage then
             U.log("%s down, waiting for %s", st.boss.id, nextStage.id)
+            showBossKillBanner(false)
             st.rootBoss = st.rootBoss or st.boss
             st.nextStage = nextStage
             st.deadKey, st.deadClass = st.bossKey, st.bossClass
             st.bossKey, st.bossClass = nil, nil
             st.bossDied = false
+            st.transitionReminded = nil
+            -- Tell the player immediately: P2 spawn/streaming can lag several seconds.
+            Toast.show(string.format("即将进入下一阶段：%s，请稍候…", nextStage.name), 12000)
             return setPhase("transition")
         end
         return victory()

@@ -88,7 +88,11 @@ tryHook("/Script/ProjectPBZ.PBZCodexSubsystem:OnCodexTrackedEnemyDied", function
 end)
 
 NotifyOnNewObject("/Script/UMG.UserWidget", function(widget)
-    if Challenge.isActive() and U.className(widget) == "W_PlayerDead_C" then
+    local name = U.className(widget)
+    if name == "W_BossDead_C" or name == "W_BossDead_Red_C" or name == "W_BossDeadRed_C" then
+        Challenge.cacheBossDeadWidget(widget)
+    end
+    if Challenge.isActive() and name == "W_PlayerDead_C" then
         Challenge.onPlayerDeadWidget()
     end
 end)
