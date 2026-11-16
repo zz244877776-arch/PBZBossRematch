@@ -562,18 +562,27 @@ local function arrayItems(arr)
     return items
 end
 
--- Combat music sticks to the last engaged enemy. Rematch jumps between bosses without the game's
--- normal disengage, so the previous fight's track can keep playing until we clear and set a new state.
+-- Softly drop exploration priority so combat can take over. Do NOT ClearMusic: that stops the
+-- Wwise playback and SetMusicState alone often leaves silence until the game re-engages naturally.
 clearStickyCombatMusic = function()
     local music = U.worldSubsystem("MusicSubsystem")
     if not music then return end
-    pcall(function() music:ClearMusic(0.5, true, false) end)
     pcall(function() music:UpdateGameplayMusic(true) end)
-    U.log("cleared sticky combat music")
+    U.log("refreshed gameplay music (no ClearMusic)")
 end
 
--- Arena music volumes map "specific enemy" names to Ak combat states. Prefer the longest name
--- match so "LionDancer" wins over a short key like "P2" when both could match a later phase id.
+-- Score a name match against the stage id. Prefer keys that end farther into the id so
+-- "LionDancer_P2" picks "P2" (WuShi_P2) over the longer prefix "LionDancer" (WuShi_P1).
+local function musicMatchScore(wanted, key)
+    local i, j = string.find(wanted, key, 1, true)
+    if i then return j * 1000 + #key end
+    i, j = string.find(key, wanted, 1, true)
+    if i then return #wanted * 1000 + #key end
+    return nil
+end
+
+-- Arena music volumes map "specific enemy" names to Ak combat states. Setting the state switches
+-- the sticky previous-boss track without clearing playback.
 applyStageMusic = function(stage)
     local music = U.worldSubsystem("MusicSubsystem")
     local center = st.spawnerLoc or U.location(U.playerPawn())
@@ -581,9 +590,8 @@ applyStageMusic = function(stage)
         U.log("stage music: no music subsystem")
         return
     end
-    pcall(function() music:ClearMusic(0.35, true, false) end)
     local wanted = compact(string.gsub(stage.id, "^BP_Monster_", ""))
-    local best, bestLen, bestName = nil, -1, nil
+    local best, bestScore, bestName = nil, -1, nil
     for _, vol in ipairs(FindAllOf("PBZMusicVolume") or {}) do
         local loc = U.location(vol)
         if loc and U.dist(loc, center) <= MUSIC_VOLUME_RADIUS then
@@ -594,10 +602,11 @@ applyStageMusic = function(stage)
                 local name = U.str(n)
                 table.insert(labels, name)
                 local key = compact(name)
-                if key ~= "" and (string.find(wanted, key, 1, true) or string.find(key, wanted, 1, true)) then
+                local score = key ~= "" and musicMatchScore(wanted, key) or nil
+                if score and score > bestScore then
                     local state = states[i]
-                    if U.valid(state) and #key > bestLen then
-                        best, bestLen, bestName = state, #key, name
+                    if U.valid(state) then
+                        best, bestScore, bestName = state, score, name
                     end
                 end
             end
