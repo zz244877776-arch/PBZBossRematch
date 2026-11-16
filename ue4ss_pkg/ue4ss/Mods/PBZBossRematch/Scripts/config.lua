@@ -9,9 +9,9 @@ return {
     -- 挑战中主动退出并返回出发铃铛
     ExitKey = "HOME",
 
-    -- 挑战中一键击杀当前 Boss（测试用，设为 false 关闭）
+    -- 挑战中一键击杀当前 Boss（测试用，设为 false 关闭；UE4SS 键名是 DEL）
     EnableKillKey = true,
-    KillKey = "END",
+    KillKey = "DEL",
 
     -- 胜利 / 失败后多久自动返回（毫秒）。胜利稍长一点，留给「斩」字和死亡演出。
     VictoryReturnDelayMs = 8000,

@@ -81,10 +81,12 @@ function M.dist(a, b)
     return math.sqrt(dx * dx + dy * dy + dz * dz)
 end
 
--- World-Partition / soft actors sometimes report Z in the millions. Teleporting there
--- drops the player through the void (seen on 悲泣溪谷龙柱 / 暗魔天堡, 血色森林, etc.).
--- Valid arenas seen up to ~±20k (e.g. 新娘阿花 cave). Bell_NLES_001 at Z≈-32510 is void and kills.
+-- Ground-level sanity: World-Partition soft actors and void bells sit at extreme Z.
+-- Valid outdoor/cave arenas stay within ~±20k (e.g. 新娘阿花). Bell_NLES_001 at Z≈-32510 is void.
+-- Separately, 龙柱试炼 / 暗魔天堡 pocket maps live at Z≈1e6–1e8 — those ARE real fight spaces;
+-- once the boss AI exists there, the player must teleport into that sky arena (not pull the boss down).
 M.MAX_SANE_ABS_Z = 28000
+M.SKY_ARENA_MIN_Z = 100000
 
 function M.saneWorldLoc(loc)
     if not loc then return false end
@@ -92,6 +94,17 @@ function M.saneWorldLoc(loc)
     if z == nil then z = loc.z end
     if type(z) ~= "number" then return false end
     return math.abs(z) < M.MAX_SANE_ABS_Z
+end
+
+function M.isSkyArenaLoc(loc)
+    if not loc then return false end
+    local z = loc.Z
+    if z == nil then z = loc.z end
+    return type(z) == "number" and z >= M.SKY_ARENA_MIN_Z
+end
+
+function M.teleportAllowedLoc(loc)
+    return M.saneWorldLoc(loc) or M.isSkyArenaLoc(loc)
 end
 
 function M.horizDist(a, b)

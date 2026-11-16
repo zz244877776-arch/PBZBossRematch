@@ -71,6 +71,11 @@ tryHook("/Script/CommonUI.CommonButtonBase:HandleButtonClicked", function(self)
     BellUI.handleClick(self:get())
 end)
 
+-- Gamepad Confirm often lands here instead of (or before) HandleButtonClicked.
+tryHook("/Script/CommonUI.CommonButtonBase:HandleTriggeringActionCommited", function(self)
+    BellUI.handleClick(self:get())
+end)
+
 tryHook("/Script/CommonUI.CommonButtonBase:HandleFocusReceived", function(self)
     BellUI.onButtonFocused(self:get())
 end)

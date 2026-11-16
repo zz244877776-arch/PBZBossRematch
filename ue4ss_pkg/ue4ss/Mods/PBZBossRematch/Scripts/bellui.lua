@@ -14,9 +14,11 @@ local BUTTON_CLASS = "W_DialogueButton_C"
 
 -- Per-instance settings the menu designer filled in on the original buttons; new buttons start empty.
 local COPIED_BUTTON_FIELDS = { "ClickSound", "OnHoverSound", "bCanPlaySound" }
-local TEMPLATE_BUTTON_FIELDS = { "ShopButton", "ManualSave", "AbilityCultivation", "CloseBtn" }
+local TEMPLATE_BUTTON_FIELDS = { "ShopButton", "ManualSave", "AbilityCultivation", "CloseBtn", "TeleportBtn", "JhsyButton" }
 
 M.OnBossChosen = nil
+
+local showMapList -- defined later; entry button / leaveList restore this action
 
 -- Only addresses are kept between frames. A Lua wrapper outliving its object crashes UE4SS as
 -- soon as it is touched (even IsValid), and the engine frees removed widgets on its next GC.
@@ -25,6 +27,7 @@ local entryKey = nil
 local poolKeys = {}      -- our list buttons, kept in MainBox and reused
 local hiddenKeys = {}    -- { key = address, vis = visibility } of original entries hidden by the list
 local buttonActions = {}
+local listKeys = {}      -- ordered keys for map / boss list
 
 local function isActivated(m)
     local ok, v = pcall(function() return m:IsActivated() end)
@@ -41,6 +44,7 @@ end
 function M.reset()
     menuKey, entryKey = nil, nil
     poolKeys, hiddenKeys, buttonActions = {}, {}, {}
+    listKeys = {}
 end
 
 local function childrenOf(box)
@@ -108,16 +112,53 @@ end
 
 local loggedCopy = false
 
-local function copyButtonSettings(m, btn)
-    local template = nil
+local function findTemplateButton(m)
     for _, field in ipairs(TEMPLATE_BUTTON_FIELDS) do
         local ok, w = pcall(function() return m[field] end)
-        if ok and U.valid(w) then
-            template = w
-            break
+        if ok and U.valid(w) then return w end
+    end
+    return nil
+end
+
+-- Only unbind Confirm; do not disable interaction — that broke mouse/gamepad on list rows.
+local function unbindConfirm(btn)
+    if not U.valid(btn) then return end
+    pcall(function() btn:UnbindTriggeringInputActionToClick() end)
+end
+
+-- Copy the template's TriggeringInputAction so gamepad A / Confirm clicks our rows
+-- (entry, map list, and boss list) the same way as the vanilla bell buttons.
+local function bindConfirm(btn, template)
+    if not U.valid(btn) then return end
+    pcall(function() btn.bIsFocusable = true end)
+    pcall(function() btn:SetIsFocusable(true) end)
+    pcall(function() btn:SetIsButtonEnabled(true) end)
+    pcall(function() btn:SetIsInteractionEnabled(true) end)
+    if U.valid(template) then
+        local copied = false
+        pcall(function()
+            local action = template.TriggeringInputAction
+            if action ~= nil then
+                btn:SetTriggeringInputAction(action)
+                copied = true
+            end
+        end)
+        if not copied then
+            pcall(function() btn.TriggeringInputAction = template.TriggeringInputAction end)
+        end
+        if not loggedCopy then
+            U.log("gamepad confirm action copied from template=%s", tostring(copied))
         end
     end
-    if not template then return end
+    pcall(function() btn:BindTriggeringInputActionToClick() end)
+end
+
+local function copyButtonSettings(m, btn)
+    local template = findTemplateButton(m)
+    if not template then
+        bindConfirm(btn, nil)
+        return
+    end
     for _, field in ipairs(COPIED_BUTTON_FIELDS) do
         local ok, err = pcall(function()
             local v = template[field]
@@ -129,6 +170,7 @@ local function copyButtonSettings(m, btn)
             U.log("button setting %s ok=%s %s", field, tostring(ok), ok and "" or tostring(err))
         end
     end
+    bindConfirm(btn, template)
     loggedCopy = true
 end
 
@@ -149,6 +191,7 @@ local function addBeforeClose(m, btn)
     if closeInBox then box:RemoveChild(close) end
     box:AddChildToVerticalBox(btn)
     if closeInBox then box:AddChildToVerticalBox(close) end
+    bindConfirm(btn, findTemplateButton(m))
 end
 
 local function isShown(w)
@@ -234,7 +277,10 @@ local function collapsePool(m)
     for _, key in ipairs(poolKeys) do
         buttonActions[key] = nil
         local b = children[key]
-        if b then pcall(function() b:SetVisibility(VIS_COLLAPSED) end) end
+        if b then
+            unbindConfirm(b)
+            pcall(function() b:SetVisibility(VIS_COLLAPSED) end)
+        end
     end
 end
 
@@ -247,8 +293,15 @@ local function hideOriginals(m)
         local ok, vis = pcall(function() return c:GetVisibility() end)
         if ok and vis ~= VIS_COLLAPSED and not pool[key] then
             table.insert(hiddenKeys, { key = key, vis = vis })
+            if key == entryKey then unbindConfirm(c) end
             pcall(function() c:SetVisibility(VIS_COLLAPSED) end)
         end
+    end
+    -- Entry must not keep Confirm while the map/boss list is open.
+    if entryKey then
+        local entry = childMap(m)[entryKey]
+        if entry then unbindConfirm(entry) end
+        buttonActions[entryKey] = nil
     end
 end
 
@@ -259,6 +312,13 @@ local function showOriginals(m)
         if c then pcall(function() c:SetVisibility(h.vis) end) end
     end
     hiddenKeys = {}
+    if entryKey then
+        local entry = children[entryKey]
+        if entry then
+            bindConfirm(entry, findTemplateButton(m))
+            buttonActions[entryKey] = function() showMapList() end
+        end
+    end
 end
 
 local function buildList(entries)
@@ -267,6 +327,8 @@ local function buildList(entries)
     hideOriginals(m)
     collapsePool(m)
     local children = childMap(m)
+    local template = findTemplateButton(m)
+    listKeys = {}
     for i, e in ipairs(entries) do
         local key = poolKeys[i]
         local b = key and children[key]
@@ -278,34 +340,40 @@ local function buildList(entries)
             poolKeys[i] = key
         end
         buttonActions[key] = e.action
+        listKeys[i] = key
         pcall(function() b:SetVisibility(VIS_VISIBLE) end)
         setLabel(b, e.label)
+        bindConfirm(b, template)
     end
+    -- Focus the first row immediately so Confirm cannot land on a stale "返回" row
+    -- left over from the previous list (map → boss transition).
+    relinkNavigation()
+    if listKeys[1] then focusKey(listKeys[1]) end
     local keys = {}
-    for i = 1, #entries do keys[i] = poolKeys[i] end
+    for i = 1, #listKeys do keys[i] = listKeys[i] end
     local function applyLabels()
         local mm = liveMenu(true)
         if not mm then return end
         local now = childMap(mm)
+        local tmpl = findTemplateButton(mm)
         for i, key in ipairs(keys) do
             local b = now[key]
-            if b then setLabel(b, entries[i].label) end
+            if b and entries[i] then
+                setLabel(b, entries[i].label)
+                bindConfirm(b, tmpl)
+            end
         end
-    end
-    U.delay(50, "bellui.labels", function()
-        applyLabels()
         relinkNavigation()
-        focusKey(keys[1])
-    end)
+    end
+    U.delay(50, "bellui.labels", applyLabels)
     U.delay(400, "bellui.labels2", applyLabels)
 end
 
 local function leaveList(m)
+    listKeys = {}
     collapsePool(m)
     showOriginals(m)
 end
-
-local showMapList
 
 local function backToMenu()
     local m = liveMenu(false)
@@ -326,8 +394,8 @@ local function showBossList(mapId, bosses)
             label = b.name .. suffix,
             action = function()
                 backToMenu()
-                local m = liveMenu(false)
-                if m then pcall(function() m:DeactivateWidget() end) end
+                local mm = liveMenu(false)
+                if mm then pcall(function() mm:DeactivateWidget() end) end
                 if M.OnBossChosen then M.OnBossChosen(b) end
             end,
         })
@@ -396,7 +464,10 @@ local function inject(m)
     local function refresh()
         local mm = liveMenu(false)
         local e = mm and childMap(mm)[entryKey]
-        if e then setLabel(e, Config.EntryLabel) end
+        if e then
+            setLabel(e, Config.EntryLabel)
+            bindConfirm(e, findTemplateButton(mm))
+        end
         relinkNavigation()
     end
     U.delay(50, "bellui.entryLabel", refresh)
@@ -433,8 +504,10 @@ function M.tick(enabled)
 end
 
 function M.handleClick(btn)
+    if not U.valid(btn) then return false end
     local action = buttonActions[U.address(btn)]
     if not action or not liveMenu(true) then return false end
+    U.log("bellui click key=%s listRows=%d", tostring(U.address(btn)), #listKeys)
     U.gameThread("bellui.click", action)
     return true
 end

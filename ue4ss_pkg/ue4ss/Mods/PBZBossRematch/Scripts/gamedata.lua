@@ -10,21 +10,27 @@ local bossRows = nil
 local bellRows = nil
 local arenaCache = U.loadTable(ARENA_CACHE_PATH) or {}
 
--- Drop sky/void coordinates learned from unloaded World-Partition actors so rematch
--- never teleports the player to Z≈2e6 / 1e7 (instant fall death).
+-- Drop void / soft-actor junk coords. Keep high-Z pocket arenas (龙柱 / 暗魔天堡).
 local function sanitizeArenaCache()
     local changed = 0
     for id, a in pairs(arenaCache) do
-        if a and a.z ~= nil and not U.saneWorldLoc({ X = a.x or 0, Y = a.y or 0, Z = a.z }) then
-            U.log("arena cache: clearing sky coords for %s (z=%s)", id, tostring(a.z))
-            a.x, a.y, a.z = nil, nil, nil
-            a.skyInvalid = true
-            changed = changed + 1
+        if a and a.z ~= nil then
+            local loc = { X = a.x or 0, Y = a.y or 0, Z = a.z }
+            if U.isSkyArenaLoc(loc) then
+                a.skyArena = true
+                a.skyInvalid = nil
+            elseif not U.saneWorldLoc(loc) then
+                U.log("arena cache: clearing void/soft coords for %s (z=%s)", id, tostring(a.z))
+                a.x, a.y, a.z = nil, nil, nil
+                a.skyInvalid = true
+                a.skyArena = nil
+                changed = changed + 1
+            end
         end
     end
     if changed > 0 then
         U.saveTable(ARENA_CACHE_PATH, arenaCache)
-        U.log("arena cache: cleared %d sky entr(y/ies)", changed)
+        U.log("arena cache: cleared %d void entr(y/ies)", changed)
     end
 end
 sanitizeArenaCache()
@@ -282,9 +288,14 @@ function M.arenaBelongsToBossMap(arena, bossMap)
     if arena.bell and arena.bell ~= "" then
         local b = M.bellById(arena.bell)
         if b and b.map ~= bossMap then return false end
+        -- Pocket arenas sit at Z≈1e7; bell travel points stay on the ground map. Skip
+        -- level/distance checks that would drop a valid 暗魔天堡 cache.
+        if arena.skyArena or arena.skyInvalid then return true end
         local mapLevel = M.levelNameForMap(bossMap)
         local bellLevel = M.levelNameForBell(arena.bell)
         if mapLevel and bellLevel and mapLevel ~= bellLevel then return false end
+    elseif arena.skyArena or arena.skyInvalid then
+        return arena.map == nil or arena.map == bossMap
     end
     if arena.x and arena.bell and arena.bell ~= "" then
         local b = M.bellById(arena.bell)
@@ -465,21 +476,33 @@ end
 -- After a sky-stored spawner finally produces a living boss on solid ground, remember that
 -- XYZ so the next rematch can hop next to the real arena instead of a map-entry bell.
 function M.rememberArenaLoc(boss, loc, spawnerId)
-    if not boss or not loc or not U.saneWorldLoc(loc) then return false end
+    if not boss or not loc then return false end
+    if not U.saneWorldLoc(loc) and not U.isSkyArenaLoc(loc) then return false end
     local bell = M.nearestBell(boss.map, loc)
     arenaCache[boss.id] = {
         map = boss.map,
         x = math.floor(loc.X), y = math.floor(loc.Y), z = math.floor(loc.Z),
         bell = bell and bell.id or "",
         spawnerId = spawnerId or (arenaCache[boss.id] and arenaCache[boss.id].spawnerId) or "",
+        skyArena = U.isSkyArenaLoc(loc) or nil,
+        skyInvalid = nil,
     }
     U.saveTable(ARENA_CACHE_PATH, arenaCache)
-    U.log("arena remembered %s at (%.0f, %.0f, %.0f) bell=%s",
-        boss.id, loc.X, loc.Y, loc.Z, arenaCache[boss.id].bell)
+    U.log("arena remembered %s at (%.0f, %.0f, %.0f) bell=%s sky=%s",
+        boss.id, loc.X, loc.Y, loc.Z, arenaCache[boss.id].bell, tostring(arenaCache[boss.id].skyArena))
     return true
 end
 
+local lastLearnAt, lastLearnWorld = 0, ""
+
 function M.learnArenas()
+    -- FindAllOf + cache rewrite hitches the game; skip repeats in the same world
+    -- (especially right after rematch reload when the player already feels stutter).
+    local world = U.worldName() or ""
+    local now = os.time()
+    if world == lastLearnWorld and (now - lastLearnAt) < 45 then
+        return 0
+    end
     local bosses = {}
     for _, b in ipairs(M.bosses()) do bosses[string.lower(b.class)] = b end
     local learned = 0
@@ -518,16 +541,25 @@ function M.learnArenas()
             end
             if not pick then
                 local any = c.list[1]
-                -- Keep map hint only; never bind a far-away / sky spawner to this boss.
+                local skyBell = any and M.nearestBell(b.map, any.loc) or nil
+                local sky = any and U.isSkyArenaLoc(any.loc)
+                -- Pocket arenas (暗魔天堡): keep full XYZ so rematch can teleport the player in.
+                -- Other soft/void junk: keep XY + nearest bell only.
                 arenaCache[b.id] = {
                     map = b.map,
-                    bell = "",
+                    bell = skyBell and skyBell.id or "",
+                    x = any and math.floor(any.loc.X) or nil,
+                    y = any and math.floor(any.loc.Y) or nil,
+                    z = sky and math.floor(any.loc.Z) or nil,
                     spawnerId = any and U.str(any.spawner.SpawnerID) or "",
-                    skyInvalid = not (any and U.saneWorldLoc(any.loc)),
+                    skyArena = sky or nil,
+                    skyInvalid = not sky,
                     farFromMap = true,
                 }
                 learned = learned + 1
-                U.log("arena learn skipped off-map/sky loc for %s", b.id)
+                U.log("arena learn sky/off-map %s: bell=%s xy=(%s,%s) z=%s skyArena=%s",
+                    b.id, arenaCache[b.id].bell, tostring(arenaCache[b.id].x), tostring(arenaCache[b.id].y),
+                    tostring(arenaCache[b.id].z), tostring(sky))
             else
                 local s, loc = pick.spawner, pick.loc
                 learned = learned + 1
@@ -540,6 +572,7 @@ function M.learnArenas()
             end
         end
     end
+    lastLearnAt, lastLearnWorld = now, world
     if learned > 0 then
         U.saveTable(ARENA_CACHE_PATH, arenaCache)
         U.log("learned %d boss arena(s) in %s", learned, U.worldName())
