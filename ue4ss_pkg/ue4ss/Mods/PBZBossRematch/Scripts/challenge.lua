@@ -65,6 +65,29 @@ local function approachTransform(target, from, distance)
     }, math.deg(yaw)
 end
 
+-- Unreal yaw degrees: 0 = +X, looking from `from` toward `to`.
+local function yawFacing(from, to)
+    local dx, dy = to.X - from.X, to.Y - from.Y
+    if dx * dx + dy * dy < 1 then return 0.0 end
+    return math.deg(math.atan(dy, dx))
+end
+
+-- Player and boss fronts face each other (used at place / pull / fight start).
+local function faceEachOther(pawn, boss)
+    pawn = pawn or U.playerPawn()
+    local p = U.location(pawn)
+    local b = U.location(boss)
+    if not U.valid(pawn) or not U.valid(boss) or not p or not b then return end
+    local playerYaw = yawFacing(p, b)
+    local bossYaw = yawFacing(b, p)
+    local playerRot = { Pitch = 0.0, Yaw = playerYaw, Roll = 0.0 }
+    local bossRot = { Pitch = 0.0, Yaw = bossYaw, Roll = 0.0 }
+    pcall(function() pawn:K2_SetActorRotation(playerRot, false) end)
+    pcall(function() U.playerController():SetControlRotation(playerRot) end)
+    pcall(function() boss:K2_SetActorRotation(bossRot, false) end)
+    U.log("faced each other playerYaw=%.1f bossYaw=%.1f", playerYaw, bossYaw)
+end
+
 local function inLevel(level)
     return string.find(U.worldName() or "", level, 1, true) ~= nil
 end
@@ -899,7 +922,10 @@ local function placePlayerNearBoss()
         return false
     end
     st.spawnerLoc = bossLoc
-    if U.dist(p, bossLoc) <= PLACE_NEAR_DISTANCES[1] + 50 then return true end
+    if U.dist(p, bossLoc) <= PLACE_NEAR_DISTANCES[1] + 50 then
+        faceEachOther(pawn, boss)
+        return true
+    end
     for _, d in ipairs(PLACE_NEAR_DISTANCES) do
         local xf, yaw = approachTransform(bossLoc, p, d)
         if U.saneWorldLoc(xf.Translation) then
@@ -907,6 +933,7 @@ local function placePlayerNearBoss()
             local ok, moved = pcall(function() return pawn:K2_TeleportTo(xf.Translation, rot) end)
             if ok and moved then
                 pcall(function() U.playerController():SetControlRotation(rot) end)
+                faceEachOther(pawn, boss)
                 U.log("player placed %.0f from boss at (%.0f, %.0f, %.0f)",
                     d, xf.Translation.X, xf.Translation.Y, xf.Translation.Z)
                 return true
@@ -944,6 +971,7 @@ local function pullBossToPlayer()
     if ok and moved then
         st.spawnerLoc = xf.Translation
         setFrozen(boss, true)
+        faceEachOther(pawn, boss)
     end
 end
 
@@ -1008,6 +1036,7 @@ local function beginFight()
     if st.phase ~= "countdown" then return end
     dismissEarlyNextStage()
     pullBossToPlayer()
+    faceEachOther(U.playerPawn(), bossPawn())
     unfreezeBoss()
     setPhase("fighting")
     Toast.show("开战：" .. st.boss.name, 2000)
