@@ -664,7 +664,10 @@ end
 -- the sticky previous-boss track without clearing playback.
 applyStageMusic = function(stage)
     local music = U.worldSubsystem("MusicSubsystem")
-    local center = st.spawnerLoc or U.location(U.playerPawn())
+    local center = st.spawnerLoc
+    if not U.saneWorldLoc(center) then
+        center = U.location(bossPawn()) or U.location(U.playerPawn())
+    end
     if not music or not center then
         U.log("stage music: no music subsystem")
         return
@@ -741,9 +744,24 @@ local function onSpawnerFound(spawner)
     local spawnerLoc = U.location(spawner)
     local pawnLoc = U.location(U.playerPawn())
     -- Soft/unloaded actors can report Z in the millions; do not teleport there.
+    -- Still approach the nearest sane bell by XY first (龙柱 / 暗魔天堡), or the sequence
+    -- starts while the player is stuck at a distant map-entry bell outside the fight volume.
     if not U.saneWorldLoc(spawnerLoc) then
-        U.log("spawner loc not sane (%.0f, %.0f, %.0f); spawning without hop",
+        U.log("spawner loc not sane (%.0f, %.0f, %.0f)",
             spawnerLoc and spawnerLoc.X or 0, spawnerLoc and spawnerLoc.Y or 0, spawnerLoc and spawnerLoc.Z or 0)
+        if not st.skyApproachDone then
+            local bell = Data.nearestBell(st.boss.map, spawnerLoc)
+            if bell and pawnLoc and U.horizDist(pawnLoc, bell.loc) > NEAR_BOSS_RADIUS then
+                st.skyApproachDone = true
+                U.log("sky spawner: approaching nearest bell %s (horiz=%.0f)",
+                    bell.id, U.horizDist(pawnLoc, bell.loc))
+                local transform = U.bellTravelTransform(bell) or bell.transform
+                local ok, err = travel(st.level, transform, bell.id)
+                if not ok then return abort(err) end
+                return
+            end
+        end
+        U.log("sky spawner: spawning after XY approach (or already near)")
         Streaming.clear()
         return startSpawn(spawner)
     end
@@ -865,24 +883,38 @@ local function tickScanning()
     nextScanStep()
 end
 
+-- Keep the player inside the fight volume. 700uu is often still outside walled arenas
+-- (seen with 暗魔天堡 / 魔渊); prefer a tight offset on solid ground only.
+local PLACE_NEAR_DISTANCES = { 180, 280, 400, 550, 700, 1000 }
+
 local function placePlayerNearBoss()
     local pawn = U.playerPawn()
     local boss = bossPawn()
-    local bossLoc = U.location(boss) or st.spawnerLoc
+    local bossLoc = U.location(boss)
     local p = U.location(pawn)
-    if not pawn or not bossLoc or not p then return end
-    if U.dist(p, bossLoc) <= NEAR_BOSS_DISTANCES[#NEAR_BOSS_DISTANCES] then return end
-    for _, d in ipairs(NEAR_BOSS_DISTANCES) do
+    if not pawn or not bossLoc or not p then return false end
+    if not U.saneWorldLoc(bossLoc) then
+        U.log("placePlayerNearBoss: boss loc not sane (%.0f, %.0f, %.0f)",
+            bossLoc.X, bossLoc.Y, bossLoc.Z)
+        return false
+    end
+    st.spawnerLoc = bossLoc
+    if U.dist(p, bossLoc) <= PLACE_NEAR_DISTANCES[1] + 50 then return true end
+    for _, d in ipairs(PLACE_NEAR_DISTANCES) do
         local xf, yaw = approachTransform(bossLoc, p, d)
-        local rot = { Pitch = 0.0, Yaw = yaw, Roll = 0.0 }
-        local ok, moved = pcall(function() return pawn:K2_TeleportTo(xf.Translation, rot) end)
-        if ok and moved then
-            pcall(function() U.playerController():SetControlRotation(rot) end)
-            U.log("player placed %.0f from boss", d)
-            return
+        if U.saneWorldLoc(xf.Translation) then
+            local rot = { Pitch = 0.0, Yaw = yaw, Roll = 0.0 }
+            local ok, moved = pcall(function() return pawn:K2_TeleportTo(xf.Translation, rot) end)
+            if ok and moved then
+                pcall(function() U.playerController():SetControlRotation(rot) end)
+                U.log("player placed %.0f from boss at (%.0f, %.0f, %.0f)",
+                    d, xf.Translation.X, xf.Translation.Y, xf.Translation.Z)
+                return true
+            end
         end
     end
     U.log("could not place player near boss")
+    return false
 end
 
 -- If the encounter sequence left the boss outside the fight volume, pull it next to the player.
@@ -892,8 +924,19 @@ local function pullBossToPlayer()
     local p = U.location(pawn)
     local b = U.location(boss)
     if not U.valid(boss) or not p or not b then return end
-    if U.dist(p, b) <= NEAR_BOSS_DISTANCES[#NEAR_BOSS_DISTANCES] then return end
+    if not U.saneWorldLoc(p) or not U.saneWorldLoc(b) then
+        U.log("pullBossToPlayer skipped: insane loc player=%s boss=%s",
+            tostring(U.saneWorldLoc(p)), tostring(U.saneWorldLoc(b)))
+        return
+    end
+    if U.dist(p, b) <= PLACE_NEAR_DISTANCES[#PLACE_NEAR_DISTANCES] then return end
+    -- Do not drag a distant special-arena boss across the map to a wrong bell.
+    if U.dist(p, b) > 12000 then
+        U.log("pullBossToPlayer skipped: boss %.0f away (place player instead)", U.dist(p, b))
+        return
+    end
     local xf, yaw = approachTransform(p, b, APPROACH_DISTANCE)
+    if not U.saneWorldLoc(xf.Translation) then return end
     -- approachTransform(target=player, from=boss) puts a point near the player; teleport the boss there.
     local rot = { Pitch = 0.0, Yaw = yaw + 180.0, Roll = 0.0 }
     local ok, moved = pcall(function() return boss:K2_TeleportTo(xf.Translation, rot) end)
@@ -910,8 +953,13 @@ local function tickSpawning()
     if spawner then pcall(function() ai = spawner.SpawnedAI end) end
     if U.valid(ai) and not isDead(ai) then
         setBoss(ai)
-        placePlayerNearBoss()
-        pullBossToPlayer()
+        local bloc = U.location(ai)
+        if U.saneWorldLoc(bloc) then
+            st.spawnerLoc = bloc
+            Data.rememberArenaLoc(st.rootBoss or st.boss, bloc, st.spawnerId)
+        end
+        local placed = placePlayerNearBoss()
+        if not placed then pullBossToPlayer() end
         dismissEarlyNextStage()
         if st.rootBoss and not Curtain.isCovered() then
             setPhase("fighting")
