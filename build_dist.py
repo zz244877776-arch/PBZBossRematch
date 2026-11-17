@@ -18,7 +18,7 @@ PAYLOAD = OUT / "payload"
 BAT = (
     "@echo off\r\n"
     "chcp 65001 >nul\r\n"
-    "powershell -NoProfile -ExecutionPolicy Bypass -STA -File \"%~dp0installer\\installer.ps1\"\r\n"
+    "%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File \"%~dp0installer\\installer.ps1\"\r\n"
     "if errorlevel 1 pause\r\n"
 )
 BAT_EN = BAT  # same launcher; UI language follows OS / in-app Language combo
@@ -90,9 +90,13 @@ def main():
 
     inst = OUT / "installer"
     inst.mkdir()
+    # UTF-16 LE + BOM: Windows PowerShell 5.1 -File / parser always honor this
+    # (UTF-8 BOM scripts break under GBK when mis-detected, showing ï»¿ / "zh" errors).
     for name in ("installer.ps1", "installer_core.ps1", "installer_i18n.ps1"):
-        text = (INSTALLER_SRC / name).read_text(encoding="utf-8").replace("\r\n", "\n").replace("\n", "\r\n")
-        (inst / name).write_text(text, encoding="utf-8-sig", newline="")
+        text = (INSTALLER_SRC / name).read_text(encoding="utf-8-sig").replace("\r\n", "\n").replace("\n", "\r\n")
+        if text.startswith("\ufeff"):
+            text = text.lstrip("\ufeff")
+        (inst / name).write_text(text, encoding="utf-16", newline="")
 
     (OUT / "安装宿敌再战Mod.bat").write_bytes(BAT.encode("ascii"))
     (OUT / "Install Boss Rematch.bat").write_bytes(BAT_EN.encode("ascii"))

@@ -1,5 +1,5 @@
-﻿# UI / log strings for the one-click installer (zh / en).
-# Saved as UTF-8 with BOM by build_dist.py for Windows PowerShell 5.1.
+﻿# UI / log strings for the one-click installer (Chinese and English).
+# build_dist.py ships these scripts as UTF-16 LE for Windows PowerShell 5.1.
 
 $script:InstallerLang = 'zh'
 

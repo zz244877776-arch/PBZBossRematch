@@ -6,8 +6,19 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
-. (Join-Path $PSScriptRoot 'installer_i18n.ps1')
-. (Join-Path $PSScriptRoot 'installer_core.ps1')
+# Windows PowerShell 5.1 plain ". script.ps1" uses ANSI (e.g. GBK) and mangles UTF-8.
+# Load companions via BOM-aware StreamReader (UTF-16 package / UTF-8 sources both OK).
+function Import-InstallerScript([string]$Path) {
+    $reader = New-Object System.IO.StreamReader($Path, $true)
+    try { $text = $reader.ReadToEnd() } finally { $reader.Close() }
+    if ($text.Length -gt 0 -and [int][char]$text[0] -eq 0xFEFF) {
+        $text = $text.Substring(1)
+    }
+    . ([scriptblock]::Create($text))
+}
+
+Import-InstallerScript (Join-Path $PSScriptRoot 'installer_i18n.ps1')
+Import-InstallerScript (Join-Path $PSScriptRoot 'installer_core.ps1')
 
 Set-InstallerLang (Get-DefaultInstallerLang)
 
