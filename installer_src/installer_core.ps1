@@ -1,6 +1,13 @@
 ﻿# 宿敌再战 Mod 安装逻辑（被 installer.ps1 引用，也可单独加载做测试）
 
-$PackageRoot = Split-Path -Parent $PSScriptRoot
+$InstallerDir = $PSScriptRoot
+if (-not $InstallerDir -and $MyInvocation.MyCommand.Path) {
+    $InstallerDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+}
+if (-not $InstallerDir) {
+    throw 'Installer script directory is unknown. Please run via 安装宿敌再战Mod.bat / Install Boss Rematch.bat'
+}
+$PackageRoot = Split-Path -Parent $InstallerDir
 $Payload = Join-Path $PackageRoot 'payload'
 $ModName = 'PBZBossRematch'
 $DocName = '宿敌再战Mod_使用说明.md'
