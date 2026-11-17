@@ -6,27 +6,28 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
-# Package builds ship UTF-16 LE (native ". file.ps1" is safe and sets $PSScriptRoot).
-# Dev sources are UTF-8: PS 5.1 ANSI/GBK mangling requires BOM-aware load + injected root.
-function Import-InstallerScript([string]$Path) {
-    $bytes = [System.IO.File]::ReadAllBytes($Path)
-    $utf16le = ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFF -and $bytes[1] -eq 0xFE)
-    $utf16be = ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFE -and $bytes[1] -eq 0xFF)
-    if ($utf16le -or $utf16be) {
-        . $Path
-        return
+# Must dot-source at script scope (NOT inside a function), or T/Get-DefaultInstallerLang vanish.
+# Package builds are UTF-16 LE; UTF-8 sources need BOM-aware load under Chinese PS 5.1.
+foreach ($__name in @('installer_i18n.ps1', 'installer_core.ps1')) {
+    $__path = Join-Path $PSScriptRoot $__name
+    $__bytes = [System.IO.File]::ReadAllBytes($__path)
+    $__utf16 = ($__bytes.Length -ge 2 -and (
+        ($__bytes[0] -eq 0xFF -and $__bytes[1] -eq 0xFE) -or
+        ($__bytes[0] -eq 0xFE -and $__bytes[1] -eq 0xFF)
+    ))
+    if ($__utf16) {
+        . $__path
+    } else {
+        $__reader = New-Object System.IO.StreamReader($__path, $true)
+        try { $__text = $__reader.ReadToEnd() } finally { $__reader.Close() }
+        if ($__text.Length -gt 0 -and [int][char]$__text[0] -eq 0xFEFF) {
+            $__text = $__text.Substring(1)
+        }
+        $__dirLit = (Split-Path -LiteralPath $__path).Replace("'", "''")
+        . ([scriptblock]::Create("`$PSScriptRoot = '$__dirLit'`r`n$__text"))
     }
-    $reader = New-Object System.IO.StreamReader($Path, $true)
-    try { $text = $reader.ReadToEnd() } finally { $reader.Close() }
-    if ($text.Length -gt 0 -and [int][char]$text[0] -eq 0xFEFF) {
-        $text = $text.Substring(1)
-    }
-    $dirLit = (Split-Path -LiteralPath $Path).Replace("'", "''")
-    . ([scriptblock]::Create("`$PSScriptRoot = '$dirLit'`r`n$text"))
 }
-
-Import-InstallerScript (Join-Path $PSScriptRoot 'installer_i18n.ps1')
-Import-InstallerScript (Join-Path $PSScriptRoot 'installer_core.ps1')
+Remove-Variable __name, __path, __bytes, __utf16, __reader, __text, __dirLit -ErrorAction SilentlyContinue
 
 Set-InstallerLang (Get-DefaultInstallerLang)
 
