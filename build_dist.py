@@ -21,6 +21,7 @@ BAT = (
     "powershell -NoProfile -ExecutionPolicy Bypass -STA -File \"%~dp0installer\\installer.ps1\"\r\n"
     "if errorlevel 1 pause\r\n"
 )
+BAT_EN = BAT  # same launcher; UI language follows OS / in-app Language combo
 
 
 def set_ini(text, key, value):
@@ -89,11 +90,12 @@ def main():
 
     inst = OUT / "installer"
     inst.mkdir()
-    for name in ("installer.ps1", "installer_core.ps1"):
+    for name in ("installer.ps1", "installer_core.ps1", "installer_i18n.ps1"):
         text = (INSTALLER_SRC / name).read_text(encoding="utf-8").replace("\r\n", "\n").replace("\n", "\r\n")
         (inst / name).write_text(text, encoding="utf-8-sig", newline="")
 
     (OUT / "安装宿敌再战Mod.bat").write_bytes(BAT.encode("ascii"))
+    (OUT / "Install Boss Rematch.bat").write_bytes(BAT_EN.encode("ascii"))
 
     zip_path = DIST / f"{PKG_NAME}.zip"
     if zip_path.exists():

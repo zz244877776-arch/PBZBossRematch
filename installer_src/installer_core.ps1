@@ -1,4 +1,4 @@
-# 宿敌再战 Mod 安装逻辑（被 installer.ps1 引用，也可单独加载做测试）
+﻿# 宿敌再战 Mod 安装逻辑（被 installer.ps1 引用，也可单独加载做测试）
 
 $PackageRoot = Split-Path -Parent $PSScriptRoot
 $Payload = Join-Path $PackageRoot 'payload'
@@ -139,9 +139,9 @@ function Install-Mod([string]$root, [bool]$installUe4ss, [bool]$backupSaves, [sc
             $bk = Join-Path $root "_rematch_backup\saves_$stamp"
             New-Item -ItemType Directory -Force -Path $bk | Out-Null
             Copy-Item -LiteralPath $saves -Destination $bk -Recurse -Force
-            & $log "已备份存档到：$bk"
+            & $log (T 'LogBackup' $bk)
         } else {
-            & $log "未找到存档文件夹，跳过备份。"
+            & $log (T 'LogNoSaves')
         }
     }
 
@@ -153,9 +153,9 @@ function Install-Mod([string]$root, [bool]$installUe4ss, [bool]$backupSaves, [sc
         if (Test-Path -LiteralPath (Join-Path $ue4ssDir 'UE4SS-settings.ini')) { $skip += 'ue4ss\UE4SS-settings.ini' }
         Copy-Tree (Join-Path $Payload 'ue4ss_runtime') $steamDir $skip
         $weInstalledUe4ss = -not $hadUe4ss
-        & $log ($(if ($hadUe4ss) { "已更新 UE4SS 框架（保留了你原有的 mods.txt 和 UE4SS-settings.ini）。" } else { "已安装 UE4SS 框架。" }))
+        & $log ($(if ($hadUe4ss) { T 'LogUe4ssUpdated' } else { T 'LogUe4ssInstalled' }))
     } else {
-        & $log "检测到已安装的 UE4SS，保持不变。"
+        & $log (T 'LogUe4ssKeep')
     }
 
     $configPath = Join-Path $modDir 'Scripts\config.lua'
@@ -163,22 +163,22 @@ function Install-Mod([string]$root, [bool]$installUe4ss, [bool]$backupSaves, [sc
     if (Test-Path -LiteralPath $configPath) { $skipMod += 'Scripts\config.lua' }
     Copy-Tree (Join-Path $Payload $ModName) $modDir $skipMod
     New-Item -ItemType Directory -Force -Path (Join-Path $modDir 'data\snapshot') | Out-Null
-    & $log ($(if ($skipMod.Count) { "已更新 Mod 脚本（保留了你原有的 config.lua 设置）。" } else { "已安装 Mod 脚本。" }))
+    & $log ($(if ($skipMod.Count) { T 'LogModUpdated' } else { T 'LogModInstalled' }))
 
     $ids = Get-SteamSaveIds $root
     $steamId = if ($ids.Count -gt 0) { [string]$ids[0] } else { '' }
     Update-ModConfig $configPath $root $steamId
     if ($steamId) {
-        & $log "存档文件夹：ProjectPBZ\Saved\SaveGames\Steam\$steamId"
-        if ($ids.Count -gt 1) { & $log "（发现多个存档文件夹，已选择最近使用的那个。如需更换，请修改 config.lua 中的 SteamId。）" }
+        & $log (T 'LogSaveFolder' $steamId)
+        if ($ids.Count -gt 1) { & $log (T 'LogMultiSave') }
     } else {
-        & $log "警告：还没有找到存档文件夹。请先进游戏存一次档，再重新运行本工具。"
+        & $log (T 'LogNoSaveWarn')
     }
 
     $modsTxt = Join-Path $ue4ssDir 'Mods\mods.txt'
     Set-ModsTxtEntry $modsTxt $ModName 1
     if (Test-Path -LiteralPath (Join-Path $ue4ssDir 'Mods\PBZBossProbe')) { Set-ModsTxtEntry $modsTxt 'PBZBossProbe' 0 }
-    & $log "已在 mods.txt 中启用 $ModName。"
+    & $log (T 'LogModsEnabled' $ModName)
 
     $manifestPath = Join-Path $modDir 'install_manifest.txt'
     $prevManifest = if (Test-Path -LiteralPath $manifestPath) { [System.IO.File]::ReadAllText($manifestPath) } else { '' }
@@ -188,14 +188,14 @@ function Install-Mod([string]$root, [bool]$installUe4ss, [bool]$backupSaves, [sc
     $doc = Join-Path $Payload $DocName
     if (Test-Path -LiteralPath $doc) {
         Copy-Item -LiteralPath $doc -Destination (Join-Path $root $DocName) -Force
-        & $log "使用说明已复制到游戏目录：$DocName"
+        & $log (T 'LogDocCopied' $DocName)
     }
     $docEn = Join-Path $Payload $DocNameEn
     if (Test-Path -LiteralPath $docEn) {
         Copy-Item -LiteralPath $docEn -Destination (Join-Path $root $DocNameEn) -Force
-        & $log "English guide copied: $DocNameEn"
+        & $log (T 'LogDocEnCopied' $DocNameEn)
     }
-    & $log "安装完成。启动游戏后，在铃铛菜单中即可看到“宿敌再战”。"
+    & $log (T 'LogInstallDone')
 }
 
 function Uninstall-Mod([string]$root, [scriptblock]$log, [scriptblock]$confirm) {
@@ -203,28 +203,28 @@ function Uninstall-Mod([string]$root, [scriptblock]$log, [scriptblock]$confirm) 
     $ue4ssDir = Join-Path $steamDir 'ue4ss'
     $modDir = Join-Path $ue4ssDir "Mods\$ModName"
     if (-not (Test-Path -LiteralPath $modDir)) {
-        & $log "没有找到已安装的 $ModName。"
+        & $log (T 'LogModMissing' $ModName)
         return
     }
     if (Test-Path -LiteralPath (Join-Path $modDir 'data\challenge_state.lua')) {
-        $go = & $confirm "检测到一场没有正常结束的挑战（存档快照尚未恢复）。`r`n`r`n建议先启动一次游戏，让 Mod 自动恢复存档后再卸载。`r`n`r`n仍然要卸载吗？"
-        if (-not $go) { & $log "已取消卸载。"; return }
+        $go = & $confirm (T 'ConfirmUnfinished')
+        if (-not $go) { & $log (T 'LogUninstallCancel'); return }
     }
     $manifestPath = Join-Path $modDir 'install_manifest.txt'
     $ue4ssByUs = (Test-Path -LiteralPath $manifestPath) -and ([System.IO.File]::ReadAllText($manifestPath) -match 'ue4ss_installed_by_tool=1')
 
     Remove-Item -LiteralPath $modDir -Recurse -Force
     Remove-ModsTxtEntry (Join-Path $ue4ssDir 'Mods\mods.txt') $ModName
-    & $log "已删除 $ModName。"
+    & $log (T 'LogModRemoved' $ModName)
 
     if ($ue4ssByUs) {
-        $removeFramework = & $confirm "UE4SS 框架是本工具安装的。要一起删除吗？`r`n（如果你还装了其他依赖 UE4SS 的 Mod，请选“否”。）"
+        $removeFramework = & $confirm (T 'ConfirmRemoveUe4ss')
         if ($removeFramework) {
             Remove-Item -LiteralPath (Join-Path $steamDir 'dwmapi.dll') -Force -ErrorAction SilentlyContinue
             Remove-Item -LiteralPath $ue4ssDir -Recurse -Force -ErrorAction SilentlyContinue
-            & $log "已删除 UE4SS 框架。"
+            & $log (T 'LogUe4ssRemoved')
         }
     }
-    & $log "卸载完成。"
+    & $log (T 'LogUninstallDone')
 }
 
