@@ -10,7 +10,7 @@ local bossRows = nil
 local bellRows = nil
 local arenaCache = U.loadTable(ARENA_CACHE_PATH) or {}
 
--- Drop void / soft-actor junk coords. Keep high-Z pocket arenas (龙柱 / 暗魔天堡).
+-- Drop void / soft-actor junk coords. Keep real high-Z pocket arenas (龙柱 / 暗魔天堡).
 local function sanitizeArenaCache()
     local changed = 0
     for id, a in pairs(arenaCache) do
@@ -34,6 +34,89 @@ local function sanitizeArenaCache()
     end
 end
 sanitizeArenaCache()
+
+-- Real sky pockets only (Z≥~1e7). Soft WP junk around Z≈2e6 must never be re-seeded here.
+local KNOWN_SKY_ARENAS = {
+}
+
+local function seedKnownSkyArenas()
+    local changed = 0
+    for id, seed in pairs(KNOWN_SKY_ARENAS) do
+        local a = arenaCache[id]
+        local loc = a and a.z ~= nil and { X = a.x or 0, Y = a.y or 0, Z = a.z } or nil
+        local hasSky = loc and U.isSkyArenaLoc(loc)
+        if a and a.unsupported and not hasSky then
+            U.log("arena seed: clearing false unsupported for %s", id)
+        end
+        if not hasSky then
+            arenaCache[id] = {
+                map = seed.map,
+                bell = seed.bell,
+                x = seed.x, y = seed.y, z = seed.z,
+                skyArena = true,
+                skyInvalid = false,
+                spawnerId = (a and a.spawnerId) or seed.spawnerId or "",
+            }
+            changed = changed + 1
+            U.log("arena seed: restored sky pocket %s bell=%s at (%d,%d,%d)",
+                id, seed.bell, seed.x, seed.y, seed.z)
+        elseif a.unsupported then
+            a.unsupported = nil
+            a.skyArena = true
+            a.skyInvalid = false
+            changed = changed + 1
+        end
+    end
+    if changed > 0 then
+        U.saveTable(ARENA_CACHE_PATH, arenaCache)
+    end
+end
+seedKnownSkyArenas()
+
+-- Ground sequence bosses whose class-matched AISpawner is soft until the Seq* family loads.
+-- 拳痴：铁狂 fights on the clearing under 镜林入口 (Bell_LZSJ_019), not in a sky pocket.
+-- LuanShi_Seq030 on the ground is RenTuZi_Ice (minion); ClaimSeqSpawn the family, then wait
+-- for BP_Monster_LuanShi. Do NOT put LuanShi_Seq030 in spawnerId (would pick the rabbit as boss).
+local KNOWN_GROUND_ARENAS = {
+    ["BP_Monster_LuanShi"] = {
+        map = "FuJiZhiLin",
+        bell = "Bell_LZSJ_019",
+        x = -44402, y = 161651, z = -314,
+        seqFamily = "LuanShi",
+    },
+}
+
+local function seedKnownGroundArenas()
+    local changed = 0
+    for id, seed in pairs(KNOWN_GROUND_ARENAS) do
+        local a = arenaCache[id]
+        local loc = a and a.z ~= nil and { X = a.x or 0, Y = a.y or 0, Z = a.z } or nil
+        local groundOk = loc and U.saneWorldLoc(loc)
+        local falseSky = a and (a.skyArena or (loc and U.isSkyArenaLoc(loc)))
+        if not groundOk or falseSky or (a and a.unsupported) or (a and a.skyInvalid) then
+            arenaCache[id] = {
+                map = seed.map,
+                bell = seed.bell,
+                x = seed.x, y = seed.y, z = seed.z,
+                seqFamily = seed.seqFamily,
+                skyArena = nil,
+                skyInvalid = nil,
+                unsupported = nil,
+                spawnerId = "",
+            }
+            changed = changed + 1
+            U.log("arena seed: ground sequence %s bell=%s at (%d,%d,%d) family=%s",
+                id, seed.bell, seed.x, seed.y, seed.z, tostring(seed.seqFamily))
+        elseif a and not a.seqFamily and seed.seqFamily then
+            a.seqFamily = seed.seqFamily
+            changed = changed + 1
+        end
+    end
+    if changed > 0 then
+        U.saveTable(ARENA_CACHE_PATH, arenaCache)
+    end
+end
+seedKnownGroundArenas()
 
 local function rowStructName(dt)
     local ok, n = pcall(function() return dt.RowStruct:GetFName():ToString() end)
@@ -416,6 +499,91 @@ function M.findSpawner(bossClass)
     return best, bestDist
 end
 
+-- Class match first; then the cached SpawnerID; then a SpawnerID that starts with the boss id
+-- when the class also matches (or is unresolved and the spawner sits in a sky pocket).
+-- Do NOT match by SpawnerID prefix alone: LuanShi_Seq030 on the ground is RenTuZi_Ice.
+function M.findSpawnerForBoss(boss)
+    if not boss then return nil end
+    local byClass, dist = M.findSpawner(boss.class)
+    if byClass then return byClass, dist end
+    local id = boss.id or (boss.class and string.gsub(boss.class, "_C$", "")) or ""
+    local wantId = arenaCache[id] and arenaCache[id].spawnerId or ""
+    -- Never treat a seq-family minion id as the boss spawner.
+    if wantId ~= "" and arenaCache[id] and arenaCache[id].seqFamily then
+        wantId = ""
+    end
+    local pawnLoc = U.location(U.playerPawn())
+    local best, bestDist = nil, math.huge
+    for _, s in ipairs(allSpawners()) do
+        local sid = U.str(s.SpawnerID)
+        local cls = M.spawnerClass(s)
+        local loc = U.location(s)
+        local match = false
+        if wantId ~= "" and wantId ~= "None" and sid == wantId then
+            match = true
+        elseif id ~= "" and sid ~= "" and (sid == id or string.find(sid, id, 1, true) == 1) then
+            if sameClass(cls, boss.class) then
+                match = true
+            elseif not cls and loc and U.isSkyArenaLoc(loc) then
+                match = true
+            end
+        end
+        if match then
+            local d = (pawnLoc and loc and U.dist(loc, pawnLoc)) or 0
+            if d < bestDist then best, bestDist = s, d end
+        end
+    end
+    return best, bestDist
+end
+
+-- Short name used in SpawnerID prefixes: BP_Monster_LuanShi -> LuanShi.
+function M.bossSeqFamily(boss)
+    if not boss then return nil end
+    local a = arenaCache[boss.id]
+    if a and a.seqFamily and a.seqFamily ~= "" then return a.seqFamily end
+    local seed = KNOWN_GROUND_ARENAS[boss.id]
+    if seed and seed.seqFamily then return seed.seqFamily end
+    return nil
+end
+
+-- Ground spawners tagged for the boss's Level Sequence (often minions, not the boss class).
+-- Used to ClaimSeqSpawn the encounter so the real boss AI appears.
+function M.findSeqFamilySpawners(boss)
+    local family = M.bossSeqFamily(boss)
+    if not family or family == "" then return {} end
+    local list = {}
+    for _, s in ipairs(allSpawners()) do
+        local sid = U.str(s.SpawnerID)
+        if sid ~= "" and string.find(sid, family, 1, true) == 1 then
+            local loc = U.location(s)
+            if loc and U.saneWorldLoc(loc) then
+                table.insert(list, s)
+            end
+        end
+    end
+    return list
+end
+
+function M.isSkyArenaBoss(boss)
+    if not boss then return false end
+    local a = arenaCache[boss.id]
+    if not a then return false end
+    if a.skyArena then return true end
+    if a.x and a.z and U.isSkyArenaLoc({ X = a.x, Y = a.y or 0, Z = a.z }) then return true end
+    -- seqFamily ground bosses are never "sky missing coords".
+    if a.seqFamily then return false end
+    return a.skyInvalid == true
+end
+
+function M.clearUnsupported(bossId)
+    local a = arenaCache[bossId]
+    if not a or not a.unsupported then return false end
+    a.unsupported = nil
+    U.saveTable(ARENA_CACHE_PATH, arenaCache)
+    U.log("cleared unsupported mark for %s", bossId)
+    return true
+end
+
 function M.logSpawnerStats()
     local parts = {}
     for k, v in pairs(methodStats) do table.insert(parts, k .. "=" .. v) end
@@ -469,7 +637,17 @@ function M.arena(bossId)
 end
 
 function M.markUnsupported(boss)
-    arenaCache[boss.id] = { map = boss.map, unsupported = true }
+    -- Keep any known sky coords so a later seed / manual fix can revive the entry.
+    local prev = arenaCache[boss.id]
+    arenaCache[boss.id] = {
+        map = boss.map,
+        unsupported = true,
+        bell = prev and prev.bell or nil,
+        x = prev and prev.x, y = prev and prev.y, z = prev and prev.z,
+        skyArena = prev and prev.skyArena or nil,
+        skyInvalid = prev and prev.skyInvalid or nil,
+        spawnerId = prev and prev.spawnerId or nil,
+    }
     U.saveTable(ARENA_CACHE_PATH, arenaCache)
 end
 
@@ -486,6 +664,7 @@ function M.rememberArenaLoc(boss, loc, spawnerId)
         spawnerId = spawnerId or (arenaCache[boss.id] and arenaCache[boss.id].spawnerId) or "",
         skyArena = U.isSkyArenaLoc(loc) or nil,
         skyInvalid = nil,
+        unsupported = nil,
     }
     U.saveTable(ARENA_CACHE_PATH, arenaCache)
     U.log("arena remembered %s at (%.0f, %.0f, %.0f) bell=%s sky=%s",

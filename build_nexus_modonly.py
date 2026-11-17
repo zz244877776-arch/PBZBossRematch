@@ -7,7 +7,7 @@ DOC_CN = WORK / "docs" / "使用说明.md"
 DOC_EN = WORK / "docs" / "Usage.en.md"
 DIST = WORK / "dist"
 OUT = DIST / "PBZBossRematch-Nexus-modonly"
-ZIP = DIST / "PBZBossRematch-v0.1.18-Nexus-modonly.zip"
+ZIP = DIST / "PBZBossRematch-v0.1.19-Nexus-modonly.zip"
 
 FORBIDDEN_SUFFIXES = (".dll", ".exe", ".bat", ".ps1")
 

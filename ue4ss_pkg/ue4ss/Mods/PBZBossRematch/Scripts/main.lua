@@ -4,6 +4,7 @@ local U = require("util")
 local Config = require("config")
 local Data = require("gamedata")
 local BellUI = require("bellui")
+local QuitUI = require("quitui")
 local Challenge = require("challenge")
 local Save = require("savesnap")
 local Streaming = require("streaming")
@@ -44,15 +45,20 @@ local function forgetStaleWidgets()
     if worldKey then U.log("world changed, dropping widget references") end
     worldKey = key
     BellUI.reset()
+    QuitUI.reset()
     Toast.reset()
     Streaming.forget()
 end
 
 LoopAsync(TICK_MS, function()
     U.gameThread("tick", function()
+        U.pumpTimers()
         forgetStaleWidgets()
         if Challenge.phase() == "reloading" and BellUI.menuOpen() then Challenge.onBellMenuOpen() end
         BellUI.tick(not Challenge.isActive())
+        -- 退出挑战 row under the System > 退出游戏 list while a rematch is running.
+        local p = Challenge.phase()
+        QuitUI.tick(Challenge.isActive() and p ~= "ending" and p ~= "reloading" and p ~= "landing")
         tickChallenge()
         if not Challenge.isActive() and os.time() - lastLearnAt >= LEARN_INTERVAL_S and U.playerPawn() and Streaming.idle() then
             lastLearnAt = os.time()
@@ -68,12 +74,16 @@ local function tryHook(path, fn)
 end
 
 tryHook("/Script/CommonUI.CommonButtonBase:HandleButtonClicked", function(self)
-    BellUI.handleClick(self:get())
+    local w = self:get()
+    if QuitUI.handleClick(w) then return end
+    BellUI.handleClick(w)
 end)
 
 -- Gamepad Confirm often lands here instead of (or before) HandleButtonClicked.
 tryHook("/Script/CommonUI.CommonButtonBase:HandleTriggeringActionCommited", function(self)
-    BellUI.handleClick(self:get())
+    local w = self:get()
+    if QuitUI.handleClick(w) then return end
+    BellUI.handleClick(w)
 end)
 
 tryHook("/Script/CommonUI.CommonButtonBase:HandleFocusReceived", function(self)
@@ -104,6 +114,7 @@ end)
 
 RegisterLoadMapPostHook(function()
     BellUI.reset()
+    QuitUI.reset()
     Toast.reset()
     U.gameThread("onMapLoaded", function() Challenge.onMapLoaded() end)
     lastLearnAt = os.time() - LEARN_INTERVAL_S + 10

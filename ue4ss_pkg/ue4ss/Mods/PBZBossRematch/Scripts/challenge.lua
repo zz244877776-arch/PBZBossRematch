@@ -9,8 +9,18 @@ local Curtain = require("curtain")
 local M = {}
 
 local TRAVEL_TIMEOUT_S = 120
-local SETTLE_AFTER_ARRIVAL_S = 3
+-- Extra time once streaming reports idle after arriving. The player stays frozen with gravity
+-- off until the reveal, so this only has to cover collision settling under the feet.
+local SETTLE_SAME_MAP_S = 1.0
+local SETTLE_CROSS_MAP_S = 2.0
 local LOCATE_TIMEOUT_S = 20
+-- World-Partition pockets at Z≥~1e7 often need longer than a ground cell.
+local SKY_LOCATE_TIMEOUT_S = 45
+-- Ground Seq* family (拳痴：铁狂): ClaimSeqSpawn minions, wait for boss class to appear.
+local SEQ_FAMILY_TIMEOUT_S = 35
+-- Traveling has already waited for streaming; locating only needs a short re-check.
+local LOCATE_SETTLE_S = 0.5
+-- A freshly moved streaming source can report idle before it has started loading.
 local SCAN_SETTLE_S = 2
 local SCAN_STEP_TIMEOUT_S = 20
 local SPAWN_TIMEOUT_S = 15
@@ -19,19 +29,26 @@ local ARRIVAL_RADIUS = 3000
 local NEAR_BOSS_RADIUS = 3000
 local APPROACH_DISTANCE = 700
 local NEAR_BOSS_DISTANCES = { 700, 500, 1000, 1400 }
-local PLAYER_HEIGHT_OFFSET = 120
+-- Keep the same Z as the boss (正前方). A positive offset put the player 前上方
+-- in sky pockets (暗魔天堡 Z≈1e7) and looked wrong on flat arenas too.
+local PLAYER_HEIGHT_OFFSET = 0
 local RELOAD_TIMEOUT_S = 20
 local RELOAD_MIN_S = 5
 local SCAN_STABLE_REGIONS = 3
 local STAGE_WAIT_S = 6
 local STAGE_FADE_AT_S = 4
 local STAGE_FADE_S = 1.0
-local PREPARE_MIN_S = 2
+local PREPARE_MIN_S = 1.0
+-- The sky pocket is streamed in only once the boss exists there, so it gets longer.
+local PREPARE_MIN_SKY_S = 2.0
 local PREPARE_TIMEOUT_S = 15
 local REVEAL_FADE_S = 0.8
+-- The countdown starts while the scene is still fading in; setup is finished by then.
+local COUNTDOWN_AFTER_REVEAL_MS = 300
+local DEPART_FADE_S = 0.35
 
--- idle -> traveling -> locating [-> scanning -> traveling -> locating] -> spawning -> preparing -> countdown
---   -> fighting -> ending -> reloading -> idle
+-- idle -> departing -> traveling -> locating [-> scanning -> traveling -> locating] -> spawning
+--   -> preparing -> countdown -> fighting -> ending -> reloading -> idle
 local st = { phase = "idle" }
 
 -- Defined later; start/return call these before their assignment runs at load time.
@@ -45,9 +62,18 @@ local function setPhase(p)
     U.log("phase %s -> %s", st.phase, p)
     st.phase = p
     st.phaseAt = os.time()
+    st.phaseClock = os.clock()
 end
 
 local function elapsed() return os.time() - (st.phaseAt or os.time()) end
+-- Sub-second version for the short loading waits; os.time() rounds them to whole seconds.
+local function elapsedS() return os.clock() - (st.phaseClock or os.clock()) end
+
+-- One line under the black screen, so the loading does not look like a hang.
+local function loadingToast(stage)
+    if not st.boss then return end
+    Toast.show(string.format("宿敌再战：%s  %s", st.boss.name, stage), 20000)
+end
 
 local function saveSub() return U.gameInstanceSubsystem("PBZSaveLoadSubsystem") end
 
@@ -108,15 +134,36 @@ local function localTeleport(transform)
     local rot = { Pitch = 0.0, Yaw = yaw, Roll = 0.0 }
     local ok, moved = pcall(function() return pawn:K2_TeleportTo(loc, rot) end)
     U.log("K2_TeleportTo ok=%s moved=%s", tostring(ok), tostring(moved))
-    if not (ok and moved) then return false, "同地图传送失败" end
-    pcall(function() U.playerController():SetControlRotation(rot) end)
-    return true
+    if ok and moved then
+        pcall(function() U.playerController():SetControlRotation(rot) end)
+        return true
+    end
+    -- MOVE_None / blocked collision can make K2_TeleportTo report moved=false while the pawn
+    -- is otherwise fine. Force the transform; streaming under the feet finishes in traveling.
+    pcall(function() pawn:K2_SetActorLocationAndRotation(loc, rot, false, nil, true) end)
+    local after = U.location(pawn)
+    if after and U.dist(after, loc) < 400 then
+        U.log("K2_SetActorLocationAndRotation fallback ok (was %.0f away)", here and U.dist(here, loc) or -1)
+        pcall(function() U.playerController():SetControlRotation(rot) end)
+        return true
+    end
+    pcall(function() pawn:K2_SetActorLocation(loc, false, nil, true) end)
+    after = U.location(pawn)
+    if after and U.dist(after, loc) < 400 then
+        U.log("K2_SetActorLocation fallback ok")
+        pcall(function() pawn:K2_SetActorRotation(rot, false) end)
+        pcall(function() U.playerController():SetControlRotation(rot) end)
+        return true
+    end
+    return false, "同地图传送失败"
 end
 
 local setPlayerTransitFrozen -- defined after setFrozen (local forward ref)
 local dismissEarlyNextStage -- defined later; used from tickSpawning
 local rematchOnDefeat -- defined later; used from tickFighting
 local finishReload -- defined later; used from returnToStart fallback
+local completeReturn -- defined after finishReload; also run once landing has settled
+local placePlayerNearBoss -- defined later; used from sky / seq-family locate
 
 local function travel(level, transform, bellId, opts)
     opts = opts or {}
@@ -142,18 +189,20 @@ local function travel(level, transform, bellId, opts)
         return false, "目标点坐标异常（可能摔死），已取消传送"
     end
 
-    st.travel = { level = level, loc = xf.Translation, bell = bellId }
     local same = inLevel(level)
+    st.travel = { level = level, loc = xf.Translation, bell = bellId, sameMap = same }
     U.log("travel level=%s bell=%s sameMap=%s at (%.0f, %.0f, %.0f)", level, bellId, tostring(same),
         xf.Translation.X, xf.Translation.Y, xf.Translation.Z)
     if Config.LoadingCurtain ~= false then setPlayerTransitFrozen(true) end
     if same then
+        -- Pre-stream the destination so the hop is less likely to be blocked by unloaded cells.
+        pcall(function() Streaming.moveTo(xf.Translation) end)
         local ok, err = localTeleport(xf)
         if not ok then
+            -- Do NOT rewrite travel.loc to the player's current spot and pretend we arrived:
+            -- that used to clear finalHop and re-enter locating forever (black-screen loop).
             U.log("local move failed: %s", tostring(err))
-            local here = U.location(U.playerPawn())
-            if here then st.travel.loc = here end
-            st.finalHop = false
+            return false, err
         end
         st.arrivedAt = nil
         setPhase("traveling")
@@ -190,6 +239,100 @@ local function isDead(actor)
     return ok and v == true
 end
 
+local function restoreActorFullHealth(actor)
+    if not U.valid(actor) then return end
+    pcall(function()
+        if actor.RestoreFullHealth then actor:RestoreFullHealth() end
+    end)
+    pcall(function()
+        if actor.SetHealthPercent then actor:SetHealthPercent(1.0) end
+    end)
+    pcall(function()
+        if actor.SetHPPercent then actor:SetHPPercent(1.0) end
+    end)
+end
+
+local function bossLocUsable(loc)
+    if not loc or U.isSoftWorldLoc(loc) then return false end
+    if st.skyArenaHop then return U.isSkyArenaLoc(loc) end
+    return U.teleportAllowedLoc(loc)
+end
+
+-- After the player dies SpawnedAI often goes soft at (0,0,0) while the visible sky
+-- boss keeps animating. Never freeze/return that soft shell.
+local function reacquireBoss()
+    if not st.boss or not st.boss.class then return nil end
+    local anchor = st.spawnerLoc
+    local function consider(a, src)
+        if not (U.valid(a) and not isDead(a)) then return nil, nil end
+        local loc = U.location(a)
+        if not bossLocUsable(loc) then return nil, nil end
+        local d = (anchor and U.horizDist(loc, anchor)) or 0
+        return a, d, loc, src
+    end
+
+    local best, bestD, bestLoc, bestSrc = nil, math.huge, nil, nil
+    local spawner = st.spawnerKey and U.live(st.spawnerClass, st.spawnerKey)
+    if spawner then
+        local ai = nil
+        pcall(function() ai = spawner.SpawnedAI end)
+        local a, d, loc, src = consider(ai, "spawner.SpawnedAI")
+        if a and d < bestD then best, bestD, bestLoc, bestSrc = a, d, loc, src end
+    end
+    for _, a in ipairs(FindAllOf(st.boss.class) or {}) do
+        local cand, d, loc, src = consider(a, "FindAllOf")
+        if cand and d < bestD then best, bestD, bestLoc, bestSrc = cand, d, loc, src end
+    end
+    if best then
+        setBoss(best)
+        U.log("reacquired boss via %s distXY=%.0f at (%.0f,%.0f,%.0f)",
+            bestSrc, bestD, bestLoc.X, bestLoc.Y, bestLoc.Z)
+        return best
+    end
+    U.log("reacquireBoss: no usable %s (skyHop=%s)", st.boss.class, tostring(st.skyArenaHop))
+    return nil
+end
+
+-- If only a soft (0,0,0) shell remains, despawn and ClaimSeqSpawn a fresh arena boss.
+local function respawnBossForRematch()
+    local spawner = st.spawnerKey and U.live(st.spawnerClass, st.spawnerKey)
+    if not spawner and st.boss then
+        spawner = Data.findSpawner(st.boss.class)
+        if spawner then
+            st.spawnerKey, st.spawnerClass = remember(spawner)
+        end
+    end
+    if not spawner then
+        U.log("respawnBossForRematch: no spawner")
+        return nil
+    end
+    if st.spawnerLoc and U.teleportAllowedLoc(st.spawnerLoc) then
+        Streaming.moveTo(st.spawnerLoc)
+    end
+    pcall(function() spawner:Despawn() end)
+    pcall(function() spawner.ShouldSpawn = true end)
+    pcall(function()
+        if spawner.SpawnerSaveInfo then spawner.SpawnerSaveInfo.IsAlive = true end
+    end)
+    local okClaim, started = false, false
+    okClaim = pcall(function() spawner:ClaimSeqSpawn(false, true, true) end)
+    pcall(function() started = spawner.bSequenceStarted == true end)
+    if not (okClaim and started) then
+        pcall(function() spawner:Spawn() end)
+    end
+    U.log("respawnBossForRematch: ClaimSeqSpawn ok=%s started=%s", tostring(okClaim), tostring(started))
+    return reacquireBoss()
+end
+
+local function ensureBossForRematch()
+    local boss = reacquireBoss()
+    if boss then return boss end
+    boss = respawnBossForRematch()
+    if boss then return boss end
+    -- One short wait for sequence spawn to produce AI.
+    return nil
+end
+
 local function pawnAddress()
     local pawn = U.playerPawn()
     return pawn and U.address(pawn) or nil
@@ -218,18 +361,24 @@ local function call(what, fn)
     U.log("%s ok=%s %s", what, tostring(ok), ok and "" or tostring(err))
 end
 
--- The game's own hit-stop keeps rewriting time dilation, so the boss is also stopped through
--- its character freeze, the SGameAI component and the behavior tree. The AI controller can be
--- possessed a moment after spawning, so the controller-side calls repeat when it changes.
-local function setFrozen(pawn, frozen)
+-- Boss and player MUST use separate freeze-slot keys. Sharing one key meant sky
+-- transit freeze on the player stomped the boss slot, so countdown StopAI never stuck.
+local function setActorFrozen(pawn, frozen, slotKey)
     if not U.valid(pawn) then return end
     local d = frozen and 0.0 or 1.0
     pcall(function() pawn.CustomTimeDilation = d end)
+    pcall(function()
+        local mesh = pawn.Mesh
+        if U.valid(mesh) then
+            mesh.GlobalAnimRateScale = frozen and 0.0 or 1.0
+        end
+    end)
     local controller = controllerOf(pawn)
     if controller then pcall(function() controller.CustomTimeDilation = d end) end
     local key = tostring(U.address(pawn)) .. "/" .. tostring(controller and U.address(controller))
-    if frozen and st.freezeKey == key then return end
-    st.freezeKey = frozen and key or nil
+    -- Same pawn+controller: still refresh dilation/anim rate above; skip StopAI spam only.
+    if frozen and st[slotKey] == key then return end
+    st[slotKey] = frozen and key or nil
     local verb = frozen and "freeze" or "release"
     call(verb .. " FreezeCharacter", function() pawn:FreezeCharacter(frozen) end)
     for _, comp in ipairs(sgameAIComponents(pawn, controller)) do
@@ -259,13 +408,24 @@ local function setFrozen(pawn, frozen)
     end
 end
 
+local function setFrozen(pawn, frozen)
+    setActorFrozen(pawn, frozen, "bossFreezeKey")
+end
+
+-- Force a full freeze pass (clears slot so StopAI runs again after controller reattach).
+local function hardFreezeBoss(pawn)
+    if not U.valid(pawn) then return end
+    st.bossFreezeKey = nil
+    setFrozen(pawn, true)
+end
+
 setPlayerTransitFrozen = function(frozen)
     local pawn = U.playerPawn()
     if frozen then
         if not U.valid(pawn) then return end
         st.playerFreezeKey = U.address(pawn)
         st.playerFreezeClass = U.className(pawn)
-        setFrozen(pawn, true)
+        setActorFrozen(pawn, true, "playerFreezeSlot")
         -- FreezeCharacter alone does not stop void fall / kill volumes.
         pcall(function()
             local move = pawn.CharacterMovement
@@ -281,7 +441,7 @@ setPlayerTransitFrozen = function(frozen)
     if st.playerFreezeKey then
         local p = U.live(st.playerFreezeClass, st.playerFreezeKey)
         if p then
-            setFrozen(p, false)
+            setActorFrozen(p, false, "playerFreezeSlot")
             pcall(function()
                 local move = p.CharacterMovement
                 if U.valid(move) then
@@ -291,23 +451,63 @@ setPlayerTransitFrozen = function(frozen)
             end)
         end
         st.playerFreezeKey, st.playerFreezeClass, st.savedGravity = nil, nil, nil
+        st.playerFreezeSlot = nil
     end
 end
 
 local function unfreezeBoss()
     if st.frozenKey then
-        local p = U.live(st.frozenClass, st.frozenKey)
+        local p = U.live(st.frozenClass, st.frozenKey) or bossPawn()
         if p then setFrozen(p, false) end
         U.log("boss released")
         st.frozenKey, st.frozenClass = nil, nil
     end
+    st.bossFreezeKey = nil
+end
+
+-- Despawn the rematch boss so it cannot linger / re-aggro at the return bell.
+local function cleanupRematchActors()
+    local function wipe(actor, tag)
+        if not (U.valid(actor) and not isDead(actor)) then return end
+        hardFreezeBoss(actor)
+        pcall(function() actor:SetActorHiddenInGame(true) end)
+        pcall(function() actor:K2_DestroyActor() end)
+        U.log("cleanup: destroyed %s", tag or "actor")
+    end
+    wipe(bossPawn(), "rematch boss")
+    if st.boss and st.boss.class then
+        for _, a in ipairs(FindAllOf(st.boss.class) or {}) do
+            local loc = U.location(a)
+            if loc and not U.isSoftWorldLoc(loc) then
+                if U.isSkyArenaLoc(loc) or (st.spawnerLoc and U.dist(loc, st.spawnerLoc) < 8000) then
+                    wipe(a, st.boss.class)
+                end
+            end
+        end
+    end
+    local spawner = st.spawnerKey and U.live(st.spawnerClass, st.spawnerKey)
+    if spawner then
+        pcall(function() spawner:Despawn() end)
+        pcall(function() spawner.ShouldSpawn = false end)
+        pcall(function()
+            if spawner.SpawnerSaveInfo then spawner.SpawnerSaveInfo.IsAlive = false end
+        end)
+        U.log("cleanup: despawned rematch spawner")
+    end
+    st.bossKey, st.bossClass, st.frozenKey, st.frozenClass = nil, nil, nil, nil
 end
 
 local function returnToStart(reason, delayMs)
-    if st.phase == "ending" or st.phase == "reloading" then return end
+    if st.phase == "ending" or st.phase == "reloading" or st.phase == "landing" then return end
     st.endReason = reason
     setPhase("ending")
-    unfreezeBoss()
+    -- Quit/abort/defeat: remove living rematch AI before save restore so the return
+    -- bell is not contested by a still-spawned boss (soft loads keep actors).
+    if reason ~= "victory" then
+        pcall(cleanupRematchActors)
+    else
+        unfreezeBoss()
+    end
     clearStickyCombatMusic()
     -- Leave the screen open during delayMs so「斩」/ toast can play; cover only for the
     -- restore + reload hitch that follows.
@@ -364,6 +564,23 @@ local function abort(msg)
     returnToStart("abort", 3000)
 end
 
+-- Prefer a grounded bell that is NOT the fight arena. Starting rematch from the
+-- boss's own bell used to make quit land back in the encounter volume (vanilla fight).
+local QUIT_BELL_MIN_SEP = 2500
+
+local function alternateBellAwayFrom(mapId, avoidId, origin)
+    local bestFar, bestFarD = nil, math.huge
+    local bestAny, bestAnyD = nil, math.huge
+    for _, b in ipairs(Data.bellsInMap(mapId) or {}) do
+        if b.id ~= avoidId and U.saneWorldLoc(b.loc) then
+            local d = (origin and U.dist(origin, b.loc)) or 0
+            if d < bestAnyD then bestAny, bestAnyD = b, d end
+            if d >= QUIT_BELL_MIN_SEP and d < bestFarD then bestFar, bestFarD = b, d end
+        end
+    end
+    return bestFar or bestAny
+end
+
 function M.start(boss)
     if M.isActive() then
         Toast.show("已经在挑战中", 2000)
@@ -414,7 +631,6 @@ function M.start(boss)
         U.log("arena cache hit bell=%s at (%.0f, %.0f, %.0f)", arena.bell, arena.x or 0, arena.y or 0, arena.z or 0)
     else
         U.log("arena cache miss; first visit uses map bell %s (next time will be faster)", firstBell.id)
-        Toast.show("首次前往该地图，正在加载……", 3000)
     end
     if not level then
         Toast.show("找不到铃铛所在关卡", 4000)
@@ -424,6 +640,23 @@ function M.start(boss)
     local bm = U.worldSubsystem("BellManager")
     local startBell = ""
     pcall(function() startBell = U.str(bm.RecentlyInteractedBellID) end)
+    -- If the player opened rematch from the fight's own bell, remember a different
+    -- quit target so exit does not drop them back into the encounter volume.
+    local arenaBellId = arenaBell and arenaBell.id or (firstBell and firstBell.id) or ""
+    if startBell == "" or startBell == arenaBellId then
+        local here = U.location(U.playerPawn())
+        local origin = here or (arenaBell and arenaBell.loc) or (firstBell and firstBell.loc)
+        local altMap = startBell ~= "" and Data.bellById(startBell)
+        local mapForQuit = (altMap and altMap.map) or boss.map
+        local alt = alternateBellAwayFrom(mapForQuit, arenaBellId, origin)
+        if not alt and mapForQuit ~= boss.map then
+            alt = alternateBellAwayFrom(boss.map, arenaBellId, origin)
+        end
+        if alt then
+            U.log("startBell %s is arena/empty; quit target → %s", tostring(startBell), alt.id)
+            startBell = alt.id
+        end
+    end
 
     local ok, err = Save.takeSnapshot({ bossId = boss.id, bossName = boss.name, startBell = startBell, startWorld = U.worldName() })
     if not ok then
@@ -431,10 +664,9 @@ function M.start(boss)
         return
     end
 
-    st = { phase = "idle", boss = boss, level = level, mapBells = mapBells }
-    Toast.show("宿敌再战：" .. boss.name, 3000)
+    st = { phase = "idle", boss = boss, level = level, mapBells = mapBells, startBell = startBell }
+    loadingToast(arenaBell and "前往中…" or "首次前往该地图，加载较慢…")
     clearStickyCombatMusic()
-    if Config.LoadingCurtain ~= false then Curtain.cover() end
 
     local transform = U.bellTravelTransform(firstBell) or firstBell.transform
     -- Same-map: hop next to a grounded arena, or into a known sky pocket arena (暗魔天堡).
@@ -443,7 +675,7 @@ function M.start(boss)
         if U.saneWorldLoc(arenaLoc) then
             transform = approachTransform(arenaLoc, arenaBell.loc, APPROACH_DISTANCE)
             st.finalHop = true
-        elseif U.isSkyArenaLoc(arenaLoc) or arena.skyArena then
+        elseif U.isSkyArenaLoc(arenaLoc) then
             -- Do not hop into the pocket here. One entry teleport runs later, once,
             -- after the boss is frozen and before countdown.
             st.skyArenaHop = true
@@ -453,13 +685,26 @@ function M.start(boss)
         end
     end
 
-    local tok, terr = travel(level, transform, firstBell.id)
-    if not tok then
-        Curtain.reveal(0.3)
-        Save.clearState()
-        st = { phase = "idle" }
-        Toast.show(terr, 5000)
+    local function depart()
+        local tok, terr = travel(level, transform, firstBell.id)
+        if not tok then
+            Curtain.reveal(0.3)
+            setPlayerTransitFrozen(false)
+            Save.clearState()
+            st = { phase = "idle" }
+            Toast.show(terr, 5000)
+        end
     end
+    if Config.LoadingCurtain == false then return depart() end
+    -- Fade to black first; the teleport and the loading hitch happen behind it.
+    setPhase("departing")
+    setPlayerTransitFrozen(true)
+    Curtain.fadeOut(DEPART_FADE_S)
+    U.delay(math.floor(DEPART_FADE_S * 1000) + 80, "challenge.depart", function()
+        if st.phase ~= "departing" then return end
+        Curtain.cover()
+        depart()
+    end)
 end
 
 local function arrived()
@@ -481,8 +726,11 @@ local function tickTraveling()
     end
     -- Wait for collision/streaming under the feet before we unfreeze / hop again.
     if not Streaming.idle() and elapsed() < TRAVEL_TIMEOUT_S then return end
-    st.arrivedAt = st.arrivedAt or os.time()
-    if os.time() - st.arrivedAt < SETTLE_AFTER_ARRIVAL_S then return end
+    st.arrivedAt = st.arrivedAt or os.clock()
+    local settle = st.travel.sameMap and SETTLE_SAME_MAP_S or SETTLE_CROSS_MAP_S
+    if os.clock() - st.arrivedAt < settle then return end
+    U.log("arrived after %.1fs", elapsedS())
+    if not st.travel.sameMap then loadingToast("加载 Boss…") end
     setPhase("locating")
 end
 
@@ -829,10 +1077,17 @@ local function onSpawnerFound(spawner)
     end
     local bell = Data.nearestBell(st.boss.map, spawnerLoc)
     local transform = approachTransform(spawnerLoc, (bell and bell.loc) or pawnLoc, APPROACH_DISTANCE)
-    st.finalHop = true
     U.log("boss spawner found %.0f away, jumping next to it", U.dist(spawnerLoc, pawnLoc))
     local ok, err = travel(st.level, transform, bell and bell.id or st.travel.bell)
-    if not ok then abort(err) end
+    if not ok then
+        -- Spawn from here rather than abort under a black curtain; placePlayerNearBoss
+        -- will pull the player in once AI exists.
+        U.log("onSpawnerFound hop failed: %s; spawn in place", tostring(err))
+        Streaming.moveTo(spawnerLoc)
+        st.finalHop = true
+        return startSpawn(spawner)
+    end
+    st.finalHop = true
 end
 
 local function spawnerCount()
@@ -843,8 +1098,7 @@ local function hopToCachedArena()
     local arena = Data.arena(st.boss.id)
     if not arena or arena.unsupported or not arena.x or arena.z == nil then return false end
     local arenaLoc = { X = arena.x, Y = arena.y, Z = arena.z }
-    local sky = U.isSkyArenaLoc(arenaLoc) or arena.skyArena
-    if sky then
+    if U.isSkyArenaLoc(arenaLoc) then
         -- Single sky entry is placePlayerNearBoss before countdown — not here.
         st.skyArenaHop = true
         U.log("skip hopToCachedArena for sky pocket; enter once before countdown")
@@ -860,28 +1114,228 @@ local function hopToCachedArena()
         st.finalHop = true
         return false
     end
+    -- One attempt only. A failed hop used to clear finalHop and retry every tick under the
+    -- black curtain (seen with 亡命徒：荆野: K2_TeleportTo moved=false for a minute+).
+    if st.cachedHopTried then
+        Streaming.moveTo(arenaLoc)
+        st.finalHop = true
+        return false
+    end
+    st.cachedHopTried = true
     local bell = (arena.bell ~= "" and Data.bellById(arena.bell)) or Data.nearestBell(st.boss.map, arenaLoc)
     local transform = approachTransform(arenaLoc, (bell and bell.loc) or pawnLoc, APPROACH_DISTANCE)
     if not U.saneWorldLoc(transform.Translation) then
         U.log("skip hopToCachedArena: approach transform not sane")
+        st.finalHop = true
+        return false
+    end
+    U.log("cached arena %.0f away, jumping next to it", U.dist(pawnLoc, arenaLoc))
+    local ok, err = travel(st.level, transform, bell and bell.id or st.travel.bell)
+    if not ok then
+        U.log("hopToCachedArena failed: %s; stream arena and continue locating", tostring(err))
+        Streaming.moveTo(arenaLoc)
+        st.finalHop = true
         return false
     end
     st.finalHop = true
-    U.log("cached arena %.0f away, jumping next to it", U.dist(pawnLoc, arenaLoc))
-    local ok, err = travel(st.level, transform, bell and bell.id or st.travel.bell)
-    if not ok then abort(err) end
     return true
+end
+
+local function findBossSpawner()
+    if Data.findSpawnerForBoss then
+        return Data.findSpawnerForBoss(st.boss)
+    end
+    return Data.findSpawner(st.boss.class)
+end
+
+local function skyPocketLoc()
+    local arena = Data.arena(st.boss.id)
+    if not arena or not arena.x or arena.z == nil then return nil, arena end
+    local loc = { X = arena.x, Y = arena.y, Z = arena.z }
+    -- Only real high-Z pockets. Ignore a stale skyArena flag on ground / soft junk coords.
+    if U.isSkyArenaLoc(loc) then return loc, arena end
+    return nil, arena
+end
+
+local function livingBossNear(center, radius)
+    radius = radius or 25000
+    local best, bestDist = nil, math.huge
+    for _, a in ipairs(FindAllOf(st.boss.class) or {}) do
+        local loc = U.location(a)
+        if U.valid(a) and not isDead(a) and loc and U.saneWorldLoc(loc) then
+            local d = center and U.dist(loc, center) or 0
+            if d < radius and d < bestDist then best, bestDist = a, d end
+        end
+    end
+    return best
+end
+
+-- 拳痴：铁狂 etc.: class-matched AISpawner stays soft; ClaimSeqSpawn the Seq* family
+-- (minions like LuanShi_Seq030 / RenTuZi_Ice) so the encounter loads the real boss.
+local function tickSeqFamilyLocating()
+    local familyName = Data.bossSeqFamily and Data.bossSeqFamily(st.boss)
+    if not familyName then return false end
+    if Config.LoadingCurtain ~= false then setPlayerTransitFrozen(true) end
+
+    if not st.seqFamilyStarted then
+        local family = Data.findSeqFamilySpawners(st.boss)
+        if #family == 0 then
+            -- Still near the seeded ground spot; wait for streaming to reveal Seq* actors.
+            if not st.seqFamilyWaitLogged then
+                st.seqFamilyWaitLogged = true
+                U.log("seq family %s: no ground spawners yet near arena", familyName)
+            end
+            if elapsed() < SEQ_FAMILY_TIMEOUT_S then
+                local arena = Data.arena(st.boss.id)
+                if arena and arena.x then
+                    Streaming.moveTo({ X = arena.x, Y = arena.y, Z = arena.z })
+                end
+                return true
+            end
+            return false
+        end
+        local anchor = U.location(family[1])
+        st.seqFamilyLoc = anchor
+        st.seqFamilyStarted = true
+        st.seqFamilyAt = os.clock()
+        Streaming.moveTo(anchor)
+        loadingToast("触发序列擂台…")
+        U.log("seq family %s: ClaimSeqSpawn %d spawner(s) at (%.0f, %.0f, %.0f)",
+            familyName, #family, anchor.X, anchor.Y, anchor.Z)
+        for _, s in ipairs(family) do
+            local sid = spawnerId(s)
+            local cls = Data.spawnerClass(s)
+            U.log("seq family member %s class=%s", sid, tostring(cls))
+            if spawnerLooksSequenced(s) then
+                trySequenceSpawn(s)
+            else
+                pcall(function() s:Spawn() end)
+            end
+        end
+        return true
+    end
+
+    local waited = os.clock() - (st.seqFamilyAt or os.clock())
+    if waited < 1.0 then return true end
+    if not Streaming.idle() and waited < SEQ_FAMILY_TIMEOUT_S then return true end
+
+    local spawner = findBossSpawner()
+    if spawner then
+        st.finalHop = true
+        onSpawnerFound(spawner)
+        return true
+    end
+
+    local living = livingBossNear(st.seqFamilyLoc)
+    if living then
+        U.log("seq family: living boss appeared after ClaimSeqSpawn")
+        if Config.LoadingCurtain ~= false then Curtain.cover() end
+        setBoss(living)
+        st.spawnerLoc = U.location(living)
+        st.frozenKey, st.frozenClass = st.bossKey, st.bossClass
+        hardFreezeBoss(living)
+        placePlayerNearBoss()
+        dismissEarlyNextStage()
+        st.revealArmed = false
+        setPhase("preparing")
+        loadingToast("就位中…")
+        return true
+    end
+
+    if waited < SEQ_FAMILY_TIMEOUT_S then
+        if math.floor(waited) ~= (st.seqFamilyNudge or -1) and math.floor(waited) % 4 == 0 then
+            st.seqFamilyNudge = math.floor(waited)
+            local family = Data.findSeqFamilySpawners(st.boss)
+            for _, s in ipairs(family) do
+                if spawnerLooksSequenced(s) then trySequenceSpawn(s) end
+            end
+            if st.seqFamilyLoc then Streaming.moveTo(st.seqFamilyLoc) end
+        end
+        return true
+    end
+
+    Streaming.clear()
+    abort(st.boss.name .. " 序列擂台未能刷出 Boss")
+    return true
+end
+
+-- Sky-pocket bosses (暗魔天堡 / 龙柱): keep the player on the ground bell under the curtain,
+-- stream the pocket in, then spawn. Do not teleport into soft Z≈2e6 junk (false sky coords).
+local function tickSkyLocating(skyLoc, arena)
+    st.skyArenaHop = true
+    if Config.LoadingCurtain ~= false then setPlayerTransitFrozen(true) end
+    if not st.skyStreamStarted then
+        st.skyStreamStarted = true
+        st.skyStreamAt = os.clock()
+        Streaming.moveTo(skyLoc)
+        loadingToast("加载天空擂台…")
+        U.log("sky locate: streaming pocket Z=%.0f bell=%s id=%s",
+            skyLoc.Z, tostring(arena and arena.bell), st.boss.id)
+        return
+    end
+    local waited = os.clock() - (st.skyStreamAt or os.clock())
+    if waited < 1.5 then return end
+    if not Streaming.idle() and elapsed() < SKY_LOCATE_TIMEOUT_S then
+        if math.floor(waited) ~= (st.skyStreamNudge or -1) and math.floor(waited) % 3 == 0 then
+            st.skyStreamNudge = math.floor(waited)
+            Streaming.moveTo(skyLoc)
+        end
+        return
+    end
+
+    local spawner = findBossSpawner()
+    if spawner then
+        st.finalHop = true
+        return onSpawnerFound(spawner)
+    end
+
+    for _, a in ipairs(FindAllOf(st.boss.class) or {}) do
+        local loc = U.location(a)
+        if U.valid(a) and not isDead(a) and U.isSkyArenaLoc(loc) then
+            U.log("sky locate: living boss already in pocket")
+            if Config.LoadingCurtain ~= false then Curtain.cover() end
+            setBoss(a)
+            st.spawnerLoc = loc
+            st.frozenKey, st.frozenClass = st.bossKey, st.bossClass
+            hardFreezeBoss(a)
+            placePlayerNearBoss()
+            dismissEarlyNextStage()
+            st.revealArmed = false
+            setPhase("preparing")
+            loadingToast("就位中…")
+            return
+        end
+    end
+
+    if elapsed() < SKY_LOCATE_TIMEOUT_S then return end
+    Streaming.clear()
+    -- Never markUnsupported: ground scans cannot see these spawners.
+    return abort(st.boss.name .. " 天空擂台未能加载（刷怪点未出现）")
 end
 
 -- Objects in regions that are still loading or unloading must not be touched, so every
 -- spawner lookup waits until the engine reports that streaming has settled.
 local function tickLocating()
-    local settled = elapsed() >= SCAN_SETTLE_S and Streaming.idle()
+    local skyLoc, arena = skyPocketLoc()
+    if skyLoc then return tickSkyLocating(skyLoc, arena) end
+
+    local settled = elapsedS() >= LOCATE_SETTLE_S and Streaming.idle()
     if not settled and elapsed() < LOCATE_TIMEOUT_S then return end
     -- Known boss spot: one short hop next to it, instead of scanning every bell on the map.
     if not st.finalHop and hopToCachedArena() then return end
-    local spawner = Data.findSpawner(st.boss.class)
+    local spawner = findBossSpawner()
     if spawner then return onSpawnerFound(spawner) end
+
+    -- Ground sequence family (拳痴：铁狂): ClaimSeqSpawn Seq* minions, wait for boss class.
+    if Data.bossSeqFamily and Data.bossSeqFamily(st.boss) then
+        if tickSeqFamilyLocating() then return end
+    end
+
+    -- skyInvalid without usable Z: ground scanning will never find the pocket spawner.
+    if Data.isSkyArenaBoss and Data.isSkyArenaBoss(st.boss) then
+        return abort(st.boss.name .. " 天空擂台坐标缺失，请先在原流程打过一次后再试")
+    end
+
     Streaming.clear()
     st.scanQueue = {}
     for _, b in ipairs(st.mapBells) do
@@ -895,6 +1349,19 @@ local function tickLocating()
     setPhase("scanning")
 end
 
+local function markUnsupportedIfGroundBoss()
+    if Data.isSkyArenaBoss and Data.isSkyArenaBoss(st.boss) then
+        U.log("skip unsupported mark for sky/sequence boss %s", st.boss.id)
+        return false
+    end
+    if Data.bossSeqFamily and Data.bossSeqFamily(st.boss) then
+        U.log("skip unsupported mark for seq-family boss %s", st.boss.id)
+        return false
+    end
+    Data.markUnsupported(st.boss)
+    return true
+end
+
 local function nextScanStep()
     local bell = table.remove(st.scanQueue, 1)
     if not bell then
@@ -902,7 +1369,7 @@ local function nextScanStep()
         -- Only remember "unsupported" when the scan provably loaded other regions;
         -- otherwise the failure says nothing about this boss.
         if st.scanLoadedMore then
-            Data.markUnsupported(st.boss)
+            markUnsupportedIfGroundBoss()
             return abort(st.boss.name .. " 暂不支持再战（找不到刷怪点）")
         end
         return abort("没能加载地图其他区域，暂时无法定位 " .. st.boss.name)
@@ -930,7 +1397,7 @@ local function tickScanning()
         end
         return
     end
-    local spawner = Data.findSpawner(st.boss.class)
+    local spawner = findBossSpawner()
     if spawner then return onSpawnerFound(spawner) end
     local count = spawnerCount()
     if count ~= st.scanBaseSpawners then st.scanLoadedMore = true end
@@ -942,7 +1409,7 @@ local function tickScanning()
     if not st.scanLoadedMore and scanned >= SCAN_STABLE_REGIONS and Data.unresolvedSpawnerCount() == 0 then
         Streaming.clear()
         U.log("map fully loaded (%d spawners, all resolved), boss has no spawner here", count)
-        Data.markUnsupported(st.boss)
+        markUnsupportedIfGroundBoss()
         return abort(st.boss.name .. " 暂不支持再战（地图中没有它的刷怪点）")
     end
     nextScanStep()
@@ -953,7 +1420,7 @@ end
 local PLACE_NEAR_DISTANCES = { 180, 280, 400, 550, 700, 1000 }
 
 -- Only teleport the player once before countdown. beginFight / pull must not move them again.
-local function placePlayerNearBoss()
+placePlayerNearBoss = function()
     if st.playerPlaced then
         faceEachOther(U.playerPawn(), bossPawn())
         return true
@@ -975,23 +1442,20 @@ local function placePlayerNearBoss()
     end
     local function finishPlace(at)
         st.playerPlaced = true
-        -- Respawn checkpoint: arena bell XY at the pocket Z (铃铛在天空盒战场内的位置).
-        local arena = Data.arena((st.rootBoss or st.boss).id)
-        local bell = arena and arena.bell and arena.bell ~= "" and Data.bellById(arena.bell)
-        if bell and U.isSkyArenaLoc(bossLoc) then
-            st.skyRespawnLoc = { X = bell.loc.X, Y = bell.loc.Y, Z = bossLoc.Z }
-        else
-            st.skyRespawnLoc = at
-        end
+        -- Always the stand point in front of the boss (same Z). Do NOT use ground-bell
+        -- XY projected into the sky pocket — that lands hundreds of meters away.
+        st.skyRespawnLoc = { X = at.X, Y = at.Y, Z = bossLoc.Z }
         faceEachOther(pawn, boss)
         Data.rememberArenaLoc(st.rootBoss or st.boss, bossLoc, st.spawnerId)
         return true
     end
-    if U.dist(p, bossLoc) <= PLACE_NEAR_DISTANCES[1] + 50 then
-        return finishPlace({ X = p.X, Y = p.Y, Z = p.Z })
+    if U.horizDist(p, bossLoc) <= PLACE_NEAR_DISTANCES[1] + 50
+        and math.abs((p.Z or 0) - bossLoc.Z) < 80 then
+        return finishPlace({ X = p.X, Y = p.Y, Z = bossLoc.Z })
     end
     for _, d in ipairs(PLACE_NEAR_DISTANCES) do
         local xf, yaw = approachTransform(bossLoc, p, d)
+        xf.Translation.Z = bossLoc.Z
         if U.teleportAllowedLoc(xf.Translation) then
             local rot = { Pitch = 0.0, Yaw = yaw, Roll = 0.0 }
             local ok, moved = pcall(function() return pawn:K2_TeleportTo(xf.Translation, rot) end)
@@ -1071,6 +1535,7 @@ local function tickSpawning()
         dismissEarlyNextStage()
         st.revealArmed = false
         setPhase("preparing")
+        loadingToast("就位中…")
         return
     end
     if not st.altSpawnTried and elapsed() > ALT_SPAWN_AFTER_S and spawner then
@@ -1127,10 +1592,30 @@ end
 
 local function beginFight()
     if st.phase ~= "countdown" then return end
+    U.log("beginFight (%s sky=%s)", st.boss and st.boss.id or "?", tostring(st.skyArenaHop))
     dismissEarlyNextStage()
+    local boss = bossPawn() or reacquireBoss()
+    if boss then
+        setBoss(boss)
+        st.frozenKey, st.frozenClass = st.bossKey, st.bossClass
+    end
     -- Do not teleport again here — placement already happened once before countdown.
-    faceEachOther(U.playerPawn(), bossPawn())
+    faceEachOther(U.playerPawn(), boss)
     unfreezeBoss()
+    -- Sky pocket: player stayed transit-frozen (zero-g) through countdown; release only now.
+    setPlayerTransitFrozen(false)
+    st.bossDied = false
+    st.playerDied = false
+    st.missingBossSince = nil
+    -- After a death-rematch the engine may briefly lose the boss handle; don't false-victory.
+    -- Real kills still win (grace only helps when a living boss can be reacquired).
+    if st.rematchAfterDefeat then
+        st.fightGraceUntil = os.clock() + 8
+        st.rematchAfterDefeat = nil
+        U.log("fight grace armed for %.0fs after defeat-rematch", 8)
+    else
+        st.fightGraceUntil = nil
+    end
     setPhase("fighting")
     Toast.show("开战：" .. st.boss.name, 2000)
     -- Always set this boss's track. Otherwise the previous rematch's combat music keeps playing
@@ -1160,21 +1645,59 @@ end
 -- The boss stays frozen behind the black screen until the world around it has finished streaming in.
 local function tickPreparing()
     local boss = bossPawn()
-    if not boss then return abort("Boss 加载失败") end
-    setFrozen(boss, true)
+    if boss and not bossLocUsable(U.location(boss)) then boss = nil end
+    if not boss then boss = reacquireBoss() end
+    -- SpawnedAI can report a soft (0,0,0) shell for a beat after the player hops in
+    -- (seen with 追命：六绝凶镰 → instant "Boss 加载失败" while cleanup still found a living AI).
+    if not boss and elapsedS() >= 1.0 then
+        boss = ensureBossForRematch()
+    end
+    if not boss then
+        if elapsed() < PREPARE_TIMEOUT_S then
+            if not st.prepareMissingLogged then
+                st.prepareMissingLogged = true
+                U.log("preparing: boss not usable yet; waiting up to %ds", PREPARE_TIMEOUT_S)
+            end
+            return
+        end
+        return abort("Boss 加载失败")
+    end
+    st.prepareMissingLogged = nil
+    -- The freeze slot is keyed by pawn + controller, so a reattached controller already gets a
+    -- full pass. Forcing one every tick re-ran StopAI / PauseLogic / StopMovement 3x a second.
+    if not controllerOf(boss) then
+        hardFreezeBoss(boss)
+    else
+        setFrozen(boss, true)
+    end
+    st.frozenKey, st.frozenClass = st.bossKey, st.bossClass
     if st.revealArmed then return end
-    local ready = elapsed() >= PREPARE_MIN_S and Streaming.idle()
+    local minS = (st.skyArenaHop or U.isSkyArenaLoc(U.location(boss))) and PREPARE_MIN_SKY_S or PREPARE_MIN_S
+    local ready = elapsedS() >= minS and Streaming.idle()
     if not ready and elapsed() < PREPARE_TIMEOUT_S then return end
-    U.log("arena ready after %ds (streaming idle=%s)", elapsed(), tostring(Streaming.idle()))
+    U.log("arena ready after %.1fs (streaming idle=%s)", elapsedS(), tostring(Streaming.idle()))
     dismissEarlyNextStage()
+    -- Re-seat if the boss was soft during the first place, or if we respawned mid-prepare.
+    if not st.playerPlaced or U.horizDist(U.location(U.playerPawn()), U.location(boss)) > PLACE_NEAR_DISTANCES[#PLACE_NEAR_DISTANCES] then
+        st.playerPlaced = false
+        placePlayerNearBoss()
+    end
     faceEachOther(U.playerPawn(), boss)
     st.revealArmed = true
-    setPlayerTransitFrozen(false)
+    -- At Z≈1e6–1e7 sky pockets (暗魔天堡), restoring Walking+gravity before countdown
+    -- can void-fall / native-crash before beginFight. Keep transit freeze until fight starts.
+    local skyHold = st.skyArenaHop or U.isSkyArenaLoc(U.location(boss))
+    if skyHold then
+        st.skyArenaHop = true
+        setPlayerTransitFrozen(true)
+        U.log("sky arena: holding player zero-g through countdown")
+    else
+        setPlayerTransitFrozen(false)
+    end
     Curtain.reveal(REVEAL_FADE_S)
-    -- Start countdown only after the fade-in so the player never sees mid-setup frames.
     local id = os.time() .. "-" .. tostring(math.random(1, 1e6))
     st.prepareRevealId = id
-    U.delay(math.floor(REVEAL_FADE_S * 1000) + 80, "challenge.prepareReveal", function()
+    U.delay(COUNTDOWN_AFTER_REVEAL_MS, "challenge.prepareReveal", function()
         if st.phase ~= "preparing" or st.prepareRevealId ~= id then return end
         startCountdown()
     end)
@@ -1182,7 +1705,29 @@ end
 
 local function tickCountdown()
     local boss = bossPawn()
-    if boss then setFrozen(boss, true) end
+    if not boss or not bossLocUsable(U.location(boss)) then
+        boss = reacquireBoss()
+    end
+    if boss then
+        -- No AI controller ⇒ previous freeze was a soft shell; force full StopAI pass.
+        if not controllerOf(boss) then
+            hardFreezeBoss(boss)
+        else
+            setFrozen(boss, true)
+        end
+        st.frozenKey, st.frozenClass = st.bossKey, st.bossClass
+    end
+    if st.skyArenaHop then
+        -- Re-assert zero-g; reveal/other systems may flip movement mode back on.
+        local pawn = U.playerPawn()
+        pcall(function()
+            local move = pawn and pawn.CharacterMovement
+            if U.valid(move) then
+                move.GravityScale = 0
+                pcall(function() move:SetMovementMode(0) end)
+            end
+        end)
+    end
     -- Sequence leftovers of the next phase must stay gone for the whole countdown.
     dismissEarlyNextStage()
 end
@@ -1476,11 +2021,144 @@ local function tickTransition()
     startSpawn(spawner)
 end
 
+local function playerDeadWidgetCount()
+    local n = 0
+    for _, w in ipairs(FindAllOf("W_PlayerDead_C") or {}) do
+        if U.valid(w) then
+            local hidden = false
+            pcall(function()
+                local vis = w:GetVisibility()
+                -- ESlateVisibility: Collapsed=1, Hidden=2
+                if vis == 1 or vis == 2 then hidden = true end
+            end)
+            if not hidden then n = n + 1 end
+        end
+    end
+    return n
+end
+
+local function clearPlayerDeadWidgets()
+    local n = 0
+    for _, w in ipairs(FindAllOf("W_PlayerDead_C") or {}) do
+        if U.valid(w) then
+            pcall(function() w:DeactivateWidget() end)
+            pcall(function() w:RemoveFromParent() end)
+            n = n + 1
+        end
+    end
+    if n > 0 then U.log("cleared %d leftover PlayerDead widget(s)", n) end
+end
+
+-- Stand on the boss's XY plane, `distance` in front (from `from` toward boss).
+local function frontOfBossLoc(bossLoc, from, distance)
+    if not bossLoc then return nil end
+    from = from or { X = bossLoc.X + 200, Y = bossLoc.Y, Z = bossLoc.Z }
+    local xf = approachTransform(bossLoc, from, distance or 180)
+    return { X = xf.Translation.X, Y = xf.Translation.Y, Z = bossLoc.Z }
+end
+
+-- After player death the live boss actor often reports a bogus near-origin location.
+-- Prefer remembered sky-pocket / spawner coords so we never fall out of 暗魔天堡.
+local function resolveDefeatBossLoc()
+    local live = U.location(bossPawn())
+    if st.skyArenaHop then
+        if live and U.isSkyArenaLoc(live) then return live, "live" end
+        if st.spawnerLoc and U.isSkyArenaLoc(st.spawnerLoc) then return st.spawnerLoc, "spawner" end
+        local arena = Data.arena((st.rootBoss or st.boss).id)
+        if arena and arena.x and arena.z then
+            local a = { X = arena.x, Y = arena.y, Z = arena.z }
+            if U.isSkyArenaLoc(a) then return a, "arenaCache" end
+        end
+        if st.skyRespawnLoc and U.isSkyArenaLoc(st.skyRespawnLoc) then
+            -- Approximate boss as "a step past" the previous stand point toward cache XY.
+            return {
+                X = st.skyRespawnLoc.X - 100,
+                Y = st.skyRespawnLoc.Y - 50,
+                Z = st.skyRespawnLoc.Z,
+            }, "skyRespawnApprox"
+        end
+        return live, "liveFallback"
+    end
+    if live and U.teleportAllowedLoc(live) then return live, "live" end
+    if st.spawnerLoc and U.teleportAllowedLoc(st.spawnerLoc) then return st.spawnerLoc, "spawner" end
+    return live or st.spawnerLoc, "any"
+end
+
+local function pickDefeatStandLoc(bossLoc)
+    if not bossLoc or not U.teleportAllowedLoc(bossLoc) then return nil end
+    if st.skyArenaHop and not U.isSkyArenaLoc(bossLoc) then return nil end
+    if st.skyRespawnLoc and U.teleportAllowedLoc(st.skyRespawnLoc) then
+        local zOk = (not st.skyArenaHop) or U.isSkyArenaLoc(st.skyRespawnLoc)
+        if zOk and U.horizDist(st.skyRespawnLoc, bossLoc) < 2500 then
+            return { X = st.skyRespawnLoc.X, Y = st.skyRespawnLoc.Y, Z = bossLoc.Z }
+        end
+    end
+    local from = st.skyRespawnLoc or { X = bossLoc.X + 200, Y = bossLoc.Y, Z = bossLoc.Z }
+    for _, d in ipairs(PLACE_NEAR_DISTANCES) do
+        local cand = frontOfBossLoc(bossLoc, from, d)
+        if cand and U.teleportAllowedLoc(cand) then
+            if (not st.skyArenaHop) or U.isSkyArenaLoc(cand) then
+                return cand
+            end
+        end
+    end
+    return nil
+end
+
 local function tickFighting()
     -- Keep sequence-spawned next phases out of the arena during the current phase.
     dismissEarlyNextStage()
+
+    -- Player death has priority: freeze boss during 陨落, then rematch (never false-victory).
+    if st.playerDied then
+        local hold = bossPawn()
+        if not hold or not bossLocUsable(U.location(hold)) then
+            hold = reacquireBoss()
+        end
+        if hold then hardFreezeBoss(hold) end
+        if not st.defeatUiWaitAt then
+            st.defeatUiWaitAt = os.clock()
+            st.fightGraceUntil = nil
+            U.log("waiting %.1fs for 陨落 UI before rematch", (tonumber(Config.DefeatUiMs) or 5500) / 1000)
+            return
+        end
+        local need = (tonumber(Config.DefeatUiMs) or 5500) / 1000
+        if (os.clock() - st.defeatUiWaitAt) < need then
+            return
+        end
+        return rematchOnDefeat()
+    end
+
     local boss = bossPawn()
-    if st.bossDied or not boss or isDead(boss) then
+    if not boss or isDead(boss) then
+        local again = reacquireBoss()
+        if again and not isDead(again) then
+            boss = again
+            st.bossDied = false
+            U.log("tickFighting: recovered living boss after missing/dead handle")
+        end
+    end
+
+    -- Grace only suppresses FALSE downs (missing handle while a living boss can be found).
+    -- Real kills (bossDied / IsDead with no living reacquire) must still win/transition.
+    if st.fightGraceUntil and os.clock() < st.fightGraceUntil then
+        if not boss or isDead(boss) then
+            local again = reacquireBoss()
+            if again and not isDead(again) then
+                U.log("fight grace: living boss recovered, ignore false down")
+                st.bossDied = false
+                return
+            end
+            if not st.bossDied and not boss then
+                U.log("fight grace: boss missing without death event, waiting")
+                return
+            end
+            -- Real death signal with no living boss → fall through.
+        end
+    end
+
+    local bossDown = st.bossDied or (boss and isDead(boss))
+    if bossDown then
         local nextStage = nextStageOf(st.boss)
         if nextStage then
             U.log("%s down, waiting for %s", st.boss.id, nextStage.id)
@@ -1490,17 +2168,31 @@ local function tickFighting()
             st.deadKey, st.deadClass = st.bossKey, st.bossClass
             st.bossKey, st.bossClass = nil, nil
             st.bossDied = false
+            st.fightGraceUntil = nil
             st.transitionReminded = nil
             st.transitionClearedEarly = nil
-            -- Tell the player immediately: P2 spawn/streaming can lag several seconds.
             Toast.show(string.format("即将进入下一阶段：%s，请稍候…", nextStage.name), 12000)
             return setPhase("transition")
         end
+        st.fightGraceUntil = nil
         return victory()
     end
-    if st.playerDied then
-        return rematchOnDefeat()
+
+    -- Missing boss without a death signal is NOT a win (was causing false「斩」after rematch).
+    if not boss then
+        U.log("tickFighting: boss handle missing, trying reacquire")
+        if not reacquireBoss() then
+            if st.missingBossSince == nil then st.missingBossSince = os.clock() end
+            if os.clock() - st.missingBossSince > 8 then
+                st.missingBossSince = nil
+                return abort("Boss 丢失，挑战结束")
+            end
+        else
+            st.missingBossSince = nil
+        end
+        return
     end
+    st.missingBossSince = nil
 end
 
 -- After any rematch death: revive in front of the boss and start countdown again.
@@ -1509,56 +2201,81 @@ rematchOnDefeat = function()
     if st.defeatRetrying then return end
     st.defeatRetrying = true
     st.playerDied = false
+    st.defeatUiWaitAt = nil
     Toast.show("战败：在 Boss 面前复活…", 4000)
     U.log("rematch defeat: respawn in front of boss, then countdown")
     if Config.LoadingCurtain ~= false then Curtain.cover() end
-    U.delay(2500, "challenge.defeatRetry", function()
+    clearPlayerDeadWidgets()
+
+    U.delay(200, "challenge.defeatRetry", function()
         if st.phase == "ending" or st.phase == "reloading" or st.phase == "idle" then
             st.defeatRetrying = false
             return
         end
         local pawn = U.playerPawn()
-        local boss = bossPawn()
-        if not (boss and not isDead(boss)) then
+        -- Must be the real sky/arena boss — soft (0,0,0) shells freeze nothing visible.
+        local boss = ensureBossForRematch()
+        if not boss then
+            -- Sequence spawn may need a moment; one more try after a short wait is handled
+            -- by staying in preparing only if we already have a boss. Here we abort.
+            boss = respawnBossForRematch() or reacquireBoss()
+        end
+        if not (boss and not isDead(boss) and bossLocUsable(U.location(boss))) then
+            U.log("defeat rematch: still no usable boss after respawn")
             st.defeatRetrying = false
             Toast.show("挑战失败，即将返回", Config.DefeatReturnDelayMs)
             return returnToStart("defeat", Config.DefeatReturnDelayMs)
         end
         if Config.LoadingCurtain ~= false then Curtain.cover() end
-        st.frozenKey, st.frozenClass = st.bossKey, st.bossClass
-        setFrozen(boss, true)
 
-        local dest = st.skyRespawnLoc
-        local bossLoc = U.location(boss) or st.spawnerLoc
-        if st.skyArenaHop and not dest and bossLoc then
-            local arena = Data.arena((st.rootBoss or st.boss).id)
-            local bell = arena and arena.bell and Data.bellById(arena.bell)
-            if bell and U.isSkyArenaLoc(bossLoc) then
-                dest = { X = bell.loc.X, Y = bell.loc.Y, Z = bossLoc.Z }
-            end
+        restoreActorFullHealth(boss)
+        st.bossDied = false
+        st.playerDied = false
+        st.fightGraceUntil = nil
+        st.missingBossSince = nil
+        st.countdownId = nil
+        st.prepareRevealId = nil
+        st.rematchAfterDefeat = true
+        st.frozenKey, st.frozenClass = st.bossKey, st.bossClass
+        hardFreezeBoss(boss)
+        local bloc = U.location(boss)
+        U.log("defeat rematch boss frozen at (%.0f,%.0f,%.0f) hasController=%s",
+            bloc and bloc.X or 0, bloc and bloc.Y or 0, bloc and bloc.Z or 0,
+            tostring(controllerOf(boss) ~= nil))
+
+        local bossLoc, locSrc = resolveDefeatBossLoc()
+        local liveNow = U.location(boss)
+        U.log("defeat bossLoc src=%s live=(%.0f,%.0f,%.0f) resolved=(%.0f,%.0f,%.0f) skyHop=%s",
+            tostring(locSrc),
+            liveNow and liveNow.X or 0, liveNow and liveNow.Y or 0, liveNow and liveNow.Z or 0,
+            bossLoc and bossLoc.X or 0, bossLoc and bossLoc.Y or 0, bossLoc and bossLoc.Z or 0,
+            tostring(st.skyArenaHop))
+
+        local dest = pickDefeatStandLoc(bossLoc)
+        if not dest then
+            U.log("defeat: no valid stand loc (skyHop=%s), aborting rematch", tostring(st.skyArenaHop))
+            st.defeatRetrying = false
+            Toast.show("挑战失败，即将返回", Config.DefeatReturnDelayMs)
+            return returnToStart("defeat", Config.DefeatReturnDelayMs)
         end
-        if not dest and bossLoc and U.teleportAllowedLoc(bossLoc) then
-            local from = U.location(pawn) or bossLoc
-            local xf = approachTransform(bossLoc, from, PLACE_NEAR_DISTANCES[1] or 180)
-            if U.teleportAllowedLoc(xf.Translation) then dest = xf.Translation end
+
+        -- Zero-g before the hop so a bad frame cannot void-fall out of the pocket.
+        setPlayerTransitFrozen(true)
+        if U.isSkyArenaLoc(dest) then
+            Streaming.moveTo(dest)
+            st.skyArenaHop = true
         end
-        if pawn and dest and U.teleportAllowedLoc(dest) then
-            local rot = { Pitch = 0.0, Yaw = yawFacing(dest, bossLoc or dest), Roll = 0.0 }
-            pcall(function() pawn:K2_TeleportTo(dest, rot) end)
-            pcall(function() U.playerController():SetControlRotation(rot) end)
-            st.playerPlaced = true
-            U.log("defeat respawn at (%.0f, %.0f, %.0f)", dest.X, dest.Y, dest.Z)
-        else
-            st.playerPlaced = false
-            placePlayerNearBoss()
-            setFrozen(boss, true)
-        end
-        pcall(function()
-            if pawn and pawn.RestoreFullHealth then pawn:RestoreFullHealth() end
-        end)
-        pcall(function()
-            if pawn and pawn.SetHealthPercent then pawn:SetHealthPercent(1.0) end
-        end)
+
+        local rot = { Pitch = 0.0, Yaw = yawFacing(dest, bossLoc or dest), Roll = 0.0 }
+        local ok, moved = pcall(function() return pawn:K2_TeleportTo(dest, rot) end)
+        pcall(function() U.playerController():SetControlRotation(rot) end)
+        st.playerPlaced = true
+        st.skyRespawnLoc = dest
+        U.log("defeat respawn ok=%s moved=%s at (%.0f, %.0f, %.0f)",
+            tostring(ok), tostring(moved), dest.X, dest.Y, dest.Z)
+
+        restoreActorFullHealth(pawn)
+        hardFreezeBoss(boss)
         faceEachOther(pawn, boss)
         st.defeatRetrying = false
         st.revealArmed = false
@@ -1593,20 +2310,81 @@ local function bossReturnBell()
     return nil
 end
 
-local function snapToBossBell()
-    local bell = bossReturnBell()
+local function pickSafeQuitBell()
+    local bossBell = bossReturnBell()
+    local avoidId = bossBell and bossBell.id
+    local boss = st.rootBoss or st.boss
+    local mapId = boss and boss.map
+    local start = st.startBell and st.startBell ~= "" and Data.bellById(st.startBell) or nil
+    if start and U.saneWorldLoc(start.loc) and start.id ~= avoidId then
+        return start, "start bell"
+    end
+    local origin = (start and start.loc)
+        or (bossBell and bossBell.loc)
+        or st.spawnerLoc
+        or U.location(U.playerPawn())
+    if mapId then
+        local alt = alternateBellAwayFrom(mapId, avoidId, origin)
+        if alt then
+            U.log("quit bell: avoiding arena %s → %s", tostring(avoidId), alt.id)
+            return alt, "safe quit bell"
+        end
+    end
+    if start and U.saneWorldLoc(start.loc) then
+        return start, "start bell (same as arena)"
+    end
+    return bossBell, "boss bell fallback"
+end
+
+-- After quit, kill any living rematch-class AI near the player / arena so the
+-- vanilla encounter volume cannot immediately re-aggro at the return point.
+local function suppressBossAfterQuit(bossInfo)
+    if not (bossInfo and bossInfo.class) then return end
+    local here = U.location(U.playerPawn())
+    local arena = Data.arena(bossInfo.id)
+    local arenaLoc = arena and arena.x and { X = arena.x, Y = arena.y, Z = arena.z or 0 } or st.spawnerLoc
+    local function nearThreat(loc)
+        if not loc or U.isSoftWorldLoc(loc) then return false end
+        if here and U.dist(loc, here) < 12000 then return true end
+        if arenaLoc and U.teleportAllowedLoc(arenaLoc) and U.dist(loc, arenaLoc) < 12000 then return true end
+        if U.isSkyArenaLoc(loc) then return true end
+        return false
+    end
+    for _, a in ipairs(FindAllOf(bossInfo.class) or {}) do
+        local loc = U.location(a)
+        if nearThreat(loc) and not isDead(a) then
+            hardFreezeBoss(a)
+            pcall(function() a:SetActorHiddenInGame(true) end)
+            pcall(function() a:K2_DestroyActor() end)
+            U.log("quit suppress: destroyed leftover %s", bossInfo.class)
+        end
+    end
+    local spawner = Data.findSpawner and Data.findSpawner(bossInfo.class) or nil
+    if U.valid(spawner) then
+        pcall(function() spawner:Despawn() end)
+        pcall(function() spawner.ShouldSpawn = false end)
+        pcall(function()
+            if spawner.SpawnerSaveInfo then spawner.SpawnerSaveInfo.IsAlive = false end
+        end)
+        U.log("quit suppress: disabled spawner for %s", bossInfo.class)
+    end
+end
+
+-- Returns ok, moved. `moved` means the pawn was teleported in this world and the ground there
+-- may not be streamed in yet.
+local function snapToBell(bell, tag)
     if not bell then
-        U.log("snap to boss bell: no sane bell for %s", tostring((st.rootBoss or st.boss) and (st.rootBoss or st.boss).id))
+        U.log("snap to %s: no bell", tag or "bell")
         return false
     end
     local xf = U.bellTravelTransform(bell) or bell.transform
     if not (xf and U.saneWorldLoc(xf.Translation)) then
-        U.log("snap to boss bell %s refused: bad transform", bell.id)
+        U.log("snap to %s %s refused: bad transform", tag or "bell", tostring(bell.id))
         return false
     end
     local here = U.location(U.playerPawn())
     if here and U.dist(here, xf.Translation) < ARRIVAL_RADIUS then
-        U.log("already at boss bell %s", bell.id)
+        U.log("already at %s %s", tag or "bell", bell.id)
         return true
     end
     local level = Data.levelNameForBell(bell.id) or ((st.rootBoss or st.boss) and (st.rootBoss or st.boss).map)
@@ -1614,13 +2392,31 @@ local function snapToBossBell()
         local sub = saveSub()
         if not sub then return false end
         local ok, err = pcall(function() sub:TeleportTo(FName(level), xf, FName(bell.id)) end)
-        U.log("snap to boss bell %s via TeleportTo ok=%s %s", bell.id, tostring(ok), ok and "" or tostring(err))
+        U.log("snap to %s %s via TeleportTo ok=%s %s", tag or "bell", bell.id, tostring(ok), ok and "" or tostring(err))
         return ok
     end
+    -- Gravity off before the jump: the destination cells load after the pawn gets there.
+    setPlayerTransitFrozen(true)
     local ok = localTeleport(xf)
-    U.log("snap to boss bell %s ok=%s at (%.0f, %.0f, %.0f)", bell.id, tostring(ok),
+    U.log("snap to %s %s ok=%s at (%.0f, %.0f, %.0f)", tag or "bell", bell.id, tostring(ok),
         xf.Translation.X, xf.Translation.Y, xf.Translation.Z)
-    return ok
+    return ok, ok
+end
+
+local function snapToBossBell()
+    return snapToBell(bossReturnBell(), "boss bell")
+end
+
+-- Quit / abort: go back to a safe start bell (never the fight arena if avoidable). Victory: boss nearby bell.
+local function snapToFinishBell()
+    if st.endReason == "quit" or st.endReason == "abort" or st.endReason == "error" or st.endReason == "recover" then
+        local bell, tag = pickSafeQuitBell()
+        if bell then
+            return snapToBell(bell, tag)
+        end
+        U.log("safe quit bell unavailable; falling back to boss bell")
+    end
+    return snapToBossBell()
 end
 
 finishReload = function()
@@ -1632,25 +2428,70 @@ finishReload = function()
         end
         return
     end
-    U.log("=== challenge finished (%s), returning to boss bell", tostring(st.endReason))
+    U.log("=== challenge finished (%s), returning to bell", tostring(st.endReason))
     Save.clearState()
-    -- Soft loads often leave the pawn at the arena; put them on the nearby ground bell.
-    pcall(snapToBossBell)
+    -- Soft loads often leave the pawn at the arena; put them on the chosen ground bell.
+    local okSnap, _, moved = pcall(snapToFinishBell)
+    if okSnap and moved then
+        -- Revealing right after a long jump dropped the player through ground that had not
+        -- loaded yet. Stay black and weightless until streaming there has finished.
+        setPhase("landing")
+        st.landingIdleTicks = 0
+        return
+    end
+    completeReturn()
+end
+
+local LANDING_MIN_S = 1.0
+local LANDING_IDLE_TICKS = 2
+local LANDING_TIMEOUT_S = 15
+
+completeReturn = function()
+    local reason = st.endReason
+    local bossInfo = st.rootBoss or st.boss
+    if reason == "quit" or reason == "abort" or reason == "error" or reason == "recover" then
+        pcall(function() suppressBossAfterQuit(bossInfo) end)
+    end
     setPlayerTransitFrozen(false)
     Curtain.reveal(0.8)
-    local reason = st.endReason
     st = { phase = "idle" }
     -- Defer arena rescans so they do not stack on top of the load hitch.
     U.delay(5000, "challenge.postReloadLearn", function()
         if st.phase == "idle" then pcall(function() Data.learnArenas() end) end
     end)
-    U.delay(4000, "challenge.backToast", function()
-        Toast.show(reason == "victory" and "挑战完成，已回到 Boss 附近铃铛" or "已返回 Boss 附近铃铛", 3000)
+    U.delay(1500, "challenge.backToast", function()
+        if reason == "victory" then
+            Toast.show("挑战完成，已回到 Boss 附近铃铛", 3000)
+        elseif reason == "quit" then
+            Toast.show("已退出挑战，回到出发铃铛", 3000)
+        else
+            Toast.show("已返回出发铃铛", 3000)
+        end
     end)
 end
 
+-- Streaming can report idle for a moment right after the jump, before the new cells are
+-- requested, so idle has to hold over consecutive ticks.
+local function tickLanding()
+    setPlayerTransitFrozen(true)
+    if Streaming.idle() then
+        st.landingIdleTicks = (st.landingIdleTicks or 0) + 1
+    else
+        st.landingIdleTicks = 0
+    end
+    local ready = elapsedS() >= LANDING_MIN_S and st.landingIdleTicks >= LANDING_IDLE_TICKS
+    if not ready and elapsedS() < LANDING_TIMEOUT_S then return end
+    U.log("landed after %.1fs (streaming idle=%s)", elapsedS(), tostring(Streaming.idle()))
+    completeReturn()
+end
+
 local function nearReturnBell()
-    local bell = bossReturnBell() or (st.startBell and Data.bellById(st.startBell))
+    local bell
+    if st.endReason == "quit" or st.endReason == "abort" or st.endReason == "error" or st.endReason == "recover" then
+        bell = pickSafeQuitBell()
+    else
+        bell = bossReturnBell() or (st.startBell and Data.bellById(st.startBell))
+    end
     local here = U.location(U.playerPawn())
     return bell and here and U.saneWorldLoc(bell.loc) and U.dist(here, bell.loc) < ARRIVAL_RADIUS
 end
@@ -1724,6 +2565,7 @@ function M.tick()
     elseif p == "fighting" then tickFighting()
     elseif p == "transition" then tickTransition()
     elseif p == "reloading" then tickReloading()
+    elseif p == "landing" then tickLanding()
     end
 end
 
@@ -1737,11 +2579,40 @@ end
 
 function M.onPlayerDeadWidget()
     local p = st.phase
-    if p == "fighting" or p == "transition" or p == "spawning" or p == "preparing" or p == "countdown"
+    if st.defeatRetrying then
+        U.log("ignore PlayerDead during defeatRetrying")
+        return
+    end
+    if p == "fighting" then
+        U.log("player died")
+        st.playerDied = true
+        return
+    end
+    -- Mid-setup fall (common if death left the pawn outside the sky pocket): re-seat, don't abort.
+    if (p == "preparing" or p == "countdown") and st.skyArenaHop then
+        U.log("player died during sky setup; re-placing into pocket")
+        clearPlayerDeadWidgets()
+        setPlayerTransitFrozen(true)
+        local bossLoc = select(1, resolveDefeatBossLoc())
+        local dest = pickDefeatStandLoc(bossLoc) or st.skyRespawnLoc
+        local pawn = U.playerPawn()
+        if pawn and dest and U.isSkyArenaLoc(dest) then
+            Streaming.moveTo(dest)
+            local rot = { Pitch = 0.0, Yaw = yawFacing(dest, bossLoc or dest), Roll = 0.0 }
+            pcall(function() pawn:K2_TeleportTo(dest, rot) end)
+            pcall(function()
+                if pawn.RestoreFullHealth then pawn:RestoreFullHealth() end
+            end)
+            st.skyRespawnLoc = dest
+            U.log("re-placed after mid-setup death at (%.0f, %.0f, %.0f)", dest.X, dest.Y, dest.Z)
+        end
+        return
+    end
+    if p == "transition" or p == "spawning" or p == "preparing" or p == "countdown"
         or p == "locating" or p == "scanning" or p == "traveling" then
         U.log("player died")
         st.playerDied = true
-        if p ~= "fighting" then returnToStart("defeat", Config.DefeatReturnDelayMs) end
+        returnToStart("defeat", Config.DefeatReturnDelayMs)
     end
 end
 
@@ -1755,6 +2626,7 @@ end
 -- Last-resort exit when the challenge logic keeps failing: get the player back with the save restored.
 function M.forceEnd(reason)
     if st.phase == "idle" or st.phase == "ending" or st.phase == "reloading" then return end
+    if st.phase == "landing" then return completeReturn() end
     U.log("force end: %s", tostring(reason))
     Toast.show("宿敌再战出错，正在返回", 4000)
     returnToStart("error", 1500)
@@ -1762,9 +2634,15 @@ end
 
 function M.quit()
     if st.phase == "idle" then return end
-    if st.phase == "ending" or st.phase == "reloading" then return end
-    Toast.show("退出挑战，正在返回", 3000)
-    returnToStart("quit", 1500)
+    if st.phase == "ending" or st.phase == "reloading" or st.phase == "landing" then return end
+    -- Cancel defeat-rematch timers so they cannot restart the fight after quit.
+    st.playerDied = false
+    st.defeatRetrying = false
+    st.defeatUiWaitAt = nil
+    st.countdownId = nil
+    st.prepareRevealId = nil
+    Toast.show("退出挑战，正在返回出发铃铛…", 3000)
+    returnToStart("quit", 800)
 end
 
 function M.killBoss()

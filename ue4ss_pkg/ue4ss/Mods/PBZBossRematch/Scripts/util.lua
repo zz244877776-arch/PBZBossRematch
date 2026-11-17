@@ -81,12 +81,12 @@ function M.dist(a, b)
     return math.sqrt(dx * dx + dy * dy + dz * dz)
 end
 
--- Ground-level sanity: World-Partition soft actors and void bells sit at extreme Z.
+-- Ground-level sanity: World-Partition soft / unloaded actors often report Z≈1e6–3e6 (void junk).
 -- Valid outdoor/cave arenas stay within ~±20k (e.g. 新娘阿花). Bell_NLES_001 at Z≈-32510 is void.
--- Separately, 龙柱试炼 / 暗魔天堡 pocket maps live at Z≈1e6–1e8 — those ARE real fight spaces;
--- once the boss AI exists there, the player must teleport into that sky arena (not pull the boss down).
+-- Real sky pockets (龙柱试炼 / 暗魔天堡) sit around Z≥1e7. Mid-range junk must NOT count as sky —
+-- the old Z≥1e5 threshold mistook 拳痴：铁狂 soft coords (Z≈2e6) for a pocket arena.
 M.MAX_SANE_ABS_Z = 28000
-M.SKY_ARENA_MIN_Z = 100000
+M.SKY_ARENA_MIN_Z = 5000000
 
 function M.saneWorldLoc(loc)
     if not loc then return false end
@@ -105,6 +105,17 @@ end
 
 function M.teleportAllowedLoc(loc)
     return M.saneWorldLoc(loc) or M.isSkyArenaLoc(loc)
+end
+
+-- After player death, UE often leaves a soft actor at the world origin. Freezing that
+-- does nothing to the real sky-arena boss still fighting at Z≈1e7.
+function M.isSoftWorldLoc(loc)
+    if not loc then return true end
+    local x = loc.X or loc.x or 0
+    local y = loc.Y or loc.y or 0
+    local z = loc.Z or loc.z or 0
+    if type(x) ~= "number" or type(y) ~= "number" or type(z) ~= "number" then return true end
+    return math.abs(x) < 100 and math.abs(y) < 100 and math.abs(z) < 100
 end
 
 function M.horizDist(a, b)
@@ -242,8 +253,50 @@ function M.gameThread(name, fn)
     end)
 end
 
+-- UE4SS sometimes loses a delayed callback: UE4SS.log then shows
+-- "[Lua::Registry::get_function_ref] Ref was not function" and the timer never fires (seen once
+-- between the reveal and the countdown, which left the boss frozen until the fight was aborted).
+-- Every delay is therefore also kept here, and the game-thread tick runs the ones UE4SS dropped.
+local timers = {}
+local timerSeq = 0
+local TIMER_LATE_S = 0.3
+
+local function fireTimer(id)
+    local t = timers[id]
+    if not t then return end
+    timers[id] = nil
+    t.fn()
+end
+
 function M.delay(ms, name, fn)
-    ExecuteWithDelay(ms, function() M.gameThread(name, fn) end)
+    timerSeq = timerSeq + 1
+    local id = timerSeq
+    timers[id] = { due = os.clock() + ms / 1000, name = name, fn = fn }
+    ExecuteWithDelay(ms, function()
+        M.gameThread(name, function() fireTimer(id) end)
+    end)
+end
+
+-- Game thread only. Runs timers that are overdue, oldest first.
+function M.pumpTimers()
+    local now = os.clock()
+    local overdue = {}
+    for id, t in pairs(timers) do
+        if now - t.due >= TIMER_LATE_S then table.insert(overdue, { id = id, due = t.due }) end
+    end
+    if #overdue == 0 then return end
+    table.sort(overdue, function(a, b)
+        if a.due ~= b.due then return a.due < b.due end
+        return a.id < b.id
+    end)
+    for _, entry in ipairs(overdue) do
+        local t = timers[entry.id]
+        if t then
+            M.log("timer %s did not fire; run from the tick %.1fs late", t.name, now - t.due)
+            local ok, err = pcall(fireTimer, entry.id)
+            if not ok then M.log("%s error: %s", t.name, tostring(err)) end
+        end
+    end
 end
 
 return M
