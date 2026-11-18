@@ -138,15 +138,88 @@ local function isHidden(id)
     return false
 end
 
+local function assetName(path)
+    return string.match(path, "%.([%w_]+)$") or path
+end
+
+local function softObjectPathStr(p)
+    local ok, r = pcall(function()
+        return p.AssetPath.PackageName:ToString() .. "." .. p.AssetPath.AssetName:ToString()
+    end)
+    return ok and r or ""
+end
+
+-- SoftClassPtr / SoftObjectPath -> "/Game/.../BP_Monster_X.BP_Monster_X_C" (or engine Conv string).
+local function softClassPathFrom(soft)
+    if soft == nil then return "" end
+    local lib = StaticFindObject("/Script/Engine.Default__KismetSystemLibrary")
+    if U.valid(lib) then
+        local ok, s = pcall(function() return lib:Conv_SoftClassReferenceToString(soft) end)
+        if ok then
+            local str = U.str(s)
+            if str ~= "" and str ~= "None" then return str end
+        end
+    end
+    local readers = {
+        function(p) return softObjectPathStr(p) end,
+        function(p) return softObjectPathStr(p.ObjectID) end,
+        function(p) return softObjectPathStr(p.SoftObjectPtr and p.SoftObjectPtr.ObjectID) end,
+        function(p)
+            return p.AssetPath.PackageName:ToString() .. "." .. p.AssetPath.AssetName:ToString()
+        end,
+        function(p) return U.str(p) end,
+    }
+    for _, read in ipairs(readers) do
+        local ok, s = pcall(function() return read(U.unwrap(soft)) end)
+        if ok then
+            local str = U.str(s)
+            if str ~= "" and str ~= "None" then return str end
+        end
+    end
+    return ""
+end
+
+local function classFromPath(path)
+    if type(path) ~= "string" or path == "" or path == "None" then return nil end
+    if string.find(path, ":", 1, true) or string.find(path, " ", 1, true) then
+        -- Engine Conv often returns BlueprintGeneratedClass'/Game/Foo.Bar_C'
+        local quoted = string.match(path, "'([^']+)'")
+        if quoted then path = quoted end
+    end
+    if string.find(path, ":", 1, true) or string.find(path, " ", 1, true) then return nil end
+    local cls = string.match(path, "%.([%a][%w_]*)'?$") or string.match(path, "^([%a][%w_]*)$")
+    if not cls or cls == "None" then return nil end
+    if not string.find(cls, "_C$") then cls = cls .. "_C" end
+    return cls
+end
+
+local function collectSoftClassPaths(arr)
+    local list = {}
+    if arr == nil then return list end
+    pcall(function()
+        arr:ForEach(function(_, elem)
+            local path = softClassPathFrom(U.unwrap(elem))
+            if path ~= "" then table.insert(list, path) end
+        end)
+    end)
+    return list
+end
+
 function M.bosses()
     if bossRows then return bossRows end
     local rows = {}
     forEachTableOf("CodexEnemyRow", function(rowName, row)
         if row.bIsBoss then
             local id = U.str(rowName)
+            local classPath = softClassPathFrom(row.EnemyClass)
+            local class = classFromPath(classPath) or (id .. "_C")
+            local replacedBy = softClassPathFrom(row.ReplacedByEnemyClass)
             table.insert(rows, {
                 id = id,
-                class = id .. "_C",
+                class = class,
+                classPath = classPath,
+                replacedByPath = (replacedBy ~= "" and replacedBy) or nil,
+                aliasPaths = collectSoftClassPaths(row.AliasEnemyClasses),
                 name = U.str(row.Enemy_CH_Hans_Name),
                 map = U.str(row.OwnMapID),
                 order = tonumber(U.str(row.DisplayOrder)) or 0,
@@ -155,7 +228,14 @@ function M.bosses()
         end
     end)
     table.sort(rows, function(a, b) return a.order < b.order end)
-    if #rows > 0 then bossRows = rows end
+    if #rows > 0 then
+        bossRows = rows
+        local withPath = 0
+        for _, b in ipairs(rows) do
+            if b.classPath and b.classPath ~= "" then withPath = withPath + 1 end
+        end
+        U.log("codex bosses loaded: %d (classPath=%d)", #rows, withPath)
+    end
     -- A second phase is reached through its first phase; one without a first phase on its map is a fight of its own.
     local chained = {}
     for _, b in ipairs(rows) do
@@ -189,15 +269,21 @@ function M.bossByClass(cls)
     return nil
 end
 
-local function assetName(path)
-    return string.match(path, "%.([%w_]+)$") or path
-end
-
-local function softObjectPathStr(p)
-    local ok, r = pcall(function()
-        return p.AssetPath.PackageName:ToString() .. "." .. p.AssetPath.AssetName:ToString()
-    end)
-    return ok and r or ""
+-- Prefer Codex SoftClass path on the boss entry; fall back to discovered/revealed paths.
+function M.bossClassPath(boss)
+    if not boss then return nil end
+    if type(boss) == "string" then
+        local want = string.lower(string.gsub(boss, "_C$", ""))
+        for _, b in ipairs(M.bosses()) do
+            if string.lower(b.id) == want or string.lower(string.gsub(b.class, "_C$", "")) == want then
+                boss = b
+                break
+            end
+        end
+        if type(boss) == "string" then return M.findEnemyClassPath(boss) end
+    end
+    if boss.classPath and boss.classPath ~= "" then return boss.classPath end
+    return M.findEnemyClassPath(boss.class or boss.id)
 end
 
 function M.discoveredClasses()
@@ -398,15 +484,6 @@ local spawnerClassCache = {}
 local methodStats = {}
 local getClassToSpawnBroken = false
 
-local function classFromPath(path)
-    if type(path) ~= "string" or path == "" or path == "None" then return nil end
-    if string.find(path, ":", 1, true) or string.find(path, " ", 1, true) then return nil end
-    local cls = string.match(path, "%.([%a][%w_]*)'?$") or string.match(path, "^([%a][%w_]*)$")
-    if not cls or cls == "None" then return nil end
-    if not string.find(cls, "_C$") then cls = cls .. "_C" end
-    return cls
-end
-
 local function kismet()
     return StaticFindObject("/Script/Engine.Default__KismetSystemLibrary")
 end
@@ -548,6 +625,7 @@ end
 
 -- Ground spawners tagged for the boss's Level Sequence (often minions, not the boss class).
 -- Used to ClaimSeqSpawn the encounter so the real boss AI appears.
+-- Include soft-loc family members too: some Seq* actors only resolve at WP soft Z.
 function M.findSeqFamilySpawners(boss)
     local family = M.bossSeqFamily(boss)
     if not family or family == "" then return {} end
@@ -555,13 +633,45 @@ function M.findSeqFamilySpawners(boss)
     for _, s in ipairs(allSpawners()) do
         local sid = U.str(s.SpawnerID)
         if sid ~= "" and string.find(sid, family, 1, true) == 1 then
-            local loc = U.location(s)
-            if loc and U.saneWorldLoc(loc) then
-                table.insert(list, s)
-            end
+            table.insert(list, s)
         end
     end
     return list
+end
+
+-- SoftObjectPath string for a boss class. Prefer CodexEnemyRow SoftClass on the boss entry.
+function M.findEnemyClassPath(bossClass)
+    local want = string.lower(string.gsub(bossClass or "", "_C$", ""))
+    if want == "" then return nil end
+    for _, b in ipairs(M.bosses()) do
+        local id = string.lower(b.id or "")
+        local cls = string.lower(string.gsub(b.class or "", "_C$", ""))
+        if id == want or cls == want then
+            if b.classPath and b.classPath ~= "" then return b.classPath end
+            break
+        end
+    end
+    local codex = U.worldSubsystem("PBZCodexSubsystem")
+    if not codex then return nil end
+    local found = nil
+    local function consider(path)
+        if not path or path == "" then return end
+        local name = string.lower(assetName(path))
+        name = string.gsub(name, "_C$", "")
+        if name == want then found = path end
+    end
+    pcall(function()
+        codex.DiscoveredEnemyPaths:ForEach(function(elem)
+            consider(softObjectPathStr(U.unwrap(elem)))
+        end)
+    end)
+    if found then return found end
+    pcall(function()
+        codex.RevealedEnemyPaths:ForEach(function(elem)
+            consider(softObjectPathStr(U.unwrap(elem)))
+        end)
+    end)
+    return found
 end
 
 function M.isSkyArenaBoss(boss)

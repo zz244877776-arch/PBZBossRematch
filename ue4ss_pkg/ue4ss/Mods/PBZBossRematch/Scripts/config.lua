@@ -41,4 +41,11 @@ return {
 
     -- 铃铛菜单入口按钮文字
     EntryLabel = "宿敌再战",
+
+    -- 挑战胜利后弹出「再战 / 退出」选择（默认关，保持原先「斩」后回铃铛）。
+    -- 游戏内按下面的键开关；开关状态会写入 data/prefs.lua。
+    PostFightChoiceEnabled = false,
+    PostFightChoiceToggleKey = "F8",
+    -- 弹出选择前先等「斩」字演出（毫秒）
+    PostFightChoiceDelayMs = 2500,
 }

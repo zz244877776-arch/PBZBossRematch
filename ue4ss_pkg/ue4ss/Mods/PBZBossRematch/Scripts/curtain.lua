@@ -8,6 +8,8 @@ local BLACK = { R = 0.0, G = 0.0, B = 0.0, A = 1.0 }
 
 -- nil = no curtain, "fading" = animating to black, "covered" = held black
 local state = nil
+-- After a World Partition map swap, SetManualCameraFade on a half-ready camera hard-crashes.
+local holdBlockedUntil = 0
 
 local function cameraManager()
     local pc = U.playerController()
@@ -24,6 +26,15 @@ local function withCamera(fn)
 end
 
 function M.isCovered() return state ~= nil end
+
+-- Keep logical "covered" across travel; do not touch the camera until streaming settles.
+function M.blockHold(seconds)
+    holdBlockedUntil = os.clock() + (seconds or 2.5)
+end
+
+function M.holdAllowed()
+    return os.clock() >= holdBlockedUntil
+end
 
 function M.cover()
     state = "covered"
@@ -50,6 +61,7 @@ end
 -- during a level transition crashed the game.
 function M.hold()
     if state ~= "covered" then return end
+    if not M.holdAllowed() then return end
     withCamera(function(cm) cm:SetManualCameraFade(1.0, BLACK, false) end)
 end
 

@@ -5,6 +5,7 @@ local Save = require("savesnap")
 local Toast = require("toast")
 local Streaming = require("streaming")
 local Curtain = require("curtain")
+local EndChoice = require("endchoice")
 
 local M = {}
 
@@ -245,12 +246,17 @@ local function restoreActorFullHealth(actor)
         if actor.RestoreFullHealth then actor:RestoreFullHealth() end
     end)
     pcall(function()
+        if actor.RestoreHealth then actor:RestoreHealth() end
+    end)
+    pcall(function()
         if actor.SetHealthPercent then actor:SetHealthPercent(1.0) end
     end)
     pcall(function()
         if actor.SetHPPercent then actor:SetHPPercent(1.0) end
     end)
 end
+
+local restorePlayerFullHealth -- defined after cheatManager
 
 local function bossLocUsable(loc)
     if not loc or U.isSoftWorldLoc(loc) then return false end
@@ -293,43 +299,130 @@ local function reacquireBoss()
     return nil
 end
 
--- If only a soft (0,0,0) shell remains, despawn and ClaimSeqSpawn a fresh arena boss.
+-- Living boss of the current class, ignoring soft/sky loc filters (caller may rescue it).
+local function findLivingBossRaw()
+    if not st.boss or not st.boss.class then return nil end
+    local spawner = st.spawnerKey and U.live(st.spawnerClass, st.spawnerKey)
+    if spawner then
+        local ai = nil
+        pcall(function() ai = spawner.SpawnedAI end)
+        if U.valid(ai) and not isDead(ai) then return ai end
+    end
+    for _, a in ipairs(FindAllOf(st.boss.class) or {}) do
+        if U.valid(a) and not isDead(a) then
+            local key = U.address(a)
+            if not (st.vetoedNextKeys and st.vetoedNextKeys[key]) then
+                return a
+            end
+        end
+    end
+    return nil
+end
+
+-- Soft WP junk (Z≈2e6) is neither ground-sane nor a real sky pocket. Drag the living AI
+-- next to the player so preparing/countdown can proceed (seen with 活人偶清道夫).
+local function rescueSoftBossToPlayer(boss)
+    local pawn = U.playerPawn()
+    local p = U.location(pawn)
+    if not (U.valid(boss) and not isDead(boss) and p and U.saneWorldLoc(p)) then return false end
+    local b = U.location(boss)
+    if bossLocUsable(b) then
+        setBoss(boss)
+        return true
+    end
+    local dest = { X = p.X + 250, Y = p.Y + 250, Z = p.Z }
+    local rot = { Pitch = 0.0, Yaw = 0.0, Roll = 0.0 }
+    local ok, moved = pcall(function() return boss:K2_TeleportTo(dest, rot) end)
+    if not (ok and moved) then
+        pcall(function() boss:K2_SetActorLocation(dest, false, nil, true) end)
+        local after = U.location(boss)
+        moved = after and U.dist(after, dest) < 600
+    end
+    U.log("rescue soft boss -> player ok=%s moved=%s to (%.0f,%.0f,%.0f) wasZ=%s",
+        tostring(ok), tostring(moved), dest.X, dest.Y, dest.Z, tostring(b and b.Z))
+    if not moved then return false end
+    setBoss(boss)
+    st.spawnerLoc = dest
+    Data.rememberArenaLoc(st.rootBoss or st.boss, dest, st.spawnerId)
+    return true
+end
+
+-- Despawn + ClaimSeqSpawn / Spawn a fresh arena boss. Prefer not to keep a soft corpse.
 local function respawnBossForRematch()
     local spawner = st.spawnerKey and U.live(st.spawnerClass, st.spawnerKey)
     if not spawner and st.boss then
-        spawner = Data.findSpawner(st.boss.class)
+        if Data.findSpawnerForBoss then
+            spawner = Data.findSpawnerForBoss(st.boss)
+        end
+        if not spawner then spawner = Data.findSpawner(st.boss.class) end
         if spawner then
             st.spawnerKey, st.spawnerClass = remember(spawner)
+            local sid = ""
+            pcall(function() sid = U.str(spawner.SpawnerID) end)
+            st.spawnerId = sid
         end
     end
     if not spawner then
         U.log("respawnBossForRematch: no spawner")
         return nil
     end
-    if st.spawnerLoc and U.teleportAllowedLoc(st.spawnerLoc) then
-        Streaming.moveTo(st.spawnerLoc)
+    local streamLoc = st.spawnerLoc
+    if not (streamLoc and U.teleportAllowedLoc(streamLoc)) then
+        streamLoc = U.location(U.playerPawn())
     end
+    if streamLoc and U.saneWorldLoc(streamLoc) then
+        Streaming.moveTo(streamLoc)
+    end
+    -- Drop any previous AI so ClaimSeqSpawn cannot "succeed" by handing back a corpse.
+    pcall(function()
+        local old = spawner.SpawnedAI
+        if U.valid(old) then pcall(function() old:K2_DestroyActor() end) end
+    end)
     pcall(function() spawner:Despawn() end)
     pcall(function() spawner.ShouldSpawn = true end)
     pcall(function()
         if spawner.SpawnerSaveInfo then spawner.SpawnerSaveInfo.IsAlive = true end
     end)
-    local okClaim, started = false, false
-    okClaim = pcall(function() spawner:ClaimSeqSpawn(false, true, true) end)
-    pcall(function() started = spawner.bSequenceStarted == true end)
-    if not (okClaim and started) then
-        pcall(function() spawner:Spawn() end)
+    local okClaim = pcall(function() spawner:ClaimSeqSpawn(false, true, true) end)
+    local pending, hasAI = false, false
+    pcall(function() pending = spawner:IsSpawnPending() == true end)
+    pcall(function() hasAI = U.valid(spawner.SpawnedAI) end)
+    local started = okClaim and (pending or hasAI)
+    if not started then
+        pcall(function() spawner:SpawnFromSequence() end)
+        pcall(function() hasAI = U.valid(spawner.SpawnedAI) end)
+        started = hasAI
+    end
+    if not started then
+        local okSpawn = pcall(function() spawner:Spawn() end)
+        U.log("respawnBossForRematch: Spawn() ok=%s", tostring(okSpawn))
     end
     U.log("respawnBossForRematch: ClaimSeqSpawn ok=%s started=%s", tostring(okClaim), tostring(started))
-    return reacquireBoss()
+    local boss = reacquireBoss()
+    if not boss then
+        boss = findLivingBossRaw()
+        if boss and not bossLocUsable(U.location(boss)) then
+            if rescueSoftBossToPlayer(boss) then return bossPawn() or boss end
+            return nil
+        end
+        if boss then setBoss(boss) end
+    end
+    return boss
 end
 
 local function ensureBossForRematch()
     local boss = reacquireBoss()
     if boss then return boss end
+    boss = findLivingBossRaw()
+    if boss then
+        if bossLocUsable(U.location(boss)) then
+            setBoss(boss)
+            return boss
+        end
+        if rescueSoftBossToPlayer(boss) then return bossPawn() or boss end
+    end
     boss = respawnBossForRematch()
     if boss then return boss end
-    -- One short wait for sequence spawn to produce AI.
     return nil
 end
 
@@ -499,6 +592,8 @@ end
 
 local function returnToStart(reason, delayMs)
     if st.phase == "ending" or st.phase == "reloading" or st.phase == "landing" then return end
+    EndChoice.hide()
+    st.choiceToken = nil
     st.endReason = reason
     setPhase("ending")
     -- Quit/abort/defeat: remove living rematch AI before save restore so the return
@@ -875,6 +970,57 @@ local function cheatManager()
     return FindFirstOf("PBZCheatManager")
 end
 
+-- Rematch should feel like ringing a Melodious Bell: HP, medicine bottles, quick items,
+-- backpack restore — not HP alone.
+local function findMelodiousBellNearPlayer()
+    local pawnLoc = U.location(U.playerPawn())
+    local best, bestDist = nil, math.huge
+    for _, cn in ipairs({ "BP_MelodiousBell_C", "MelodiousBell" }) do
+        for _, b in ipairs(FindAllOf(cn) or {}) do
+            if U.valid(b) then
+                local loc = U.location(b)
+                local d = (pawnLoc and loc and U.dist(loc, pawnLoc)) or 0
+                if d < bestDist then best, bestDist = b, d end
+            end
+        end
+    end
+    return best
+end
+
+restorePlayerFullHealth = function()
+    local pawn = U.playerPawn()
+    if not U.valid(pawn) then return end
+    restoreActorFullHealth(pawn)
+    pcall(function()
+        local lib = StaticFindObject("/Script/ProjectPBZ.Default__PBZRestoreQueryLibrary")
+        if U.valid(lib) then lib:ResetHealthToMax(pawn) end
+    end)
+    local cm = cheatManager()
+    if U.valid(cm) then
+        pcall(function() cm:GM_FullHeal() end)
+    end
+
+    local bp = U.worldSubsystem("PBZBackPackSubsystem") or FindFirstOf("PBZBackPackSubsystem")
+    if U.valid(bp) then
+        pcall(function() bp:RestoreQuickItems() end)
+        pcall(function() bp:RestoreShaqiWeaponBullet() end)
+        -- Do NOT StartInteractBell here: that opens the bell interaction flow mid-rematch.
+    end
+
+    local bell = findMelodiousBellNearPlayer()
+    if U.valid(bell) then
+        pcall(function() bell:RestoreHealth() end)
+        -- Blueprint display name has spaces.
+        pcall(function() bell["Restore BackPack Data"](bell) end)
+        pcall(function() bell.Restore_BackPack_Data(bell) end)
+        -- IsPlaySound=false, IsPushUI=false, IsRestore=true — restore without menu.
+        pcall(function() bell:DoInteractNoAnim(false, false, true) end)
+        U.log("player bell-like restore via %s", U.fullName(bell))
+    else
+        U.log("player bell-like restore: no MelodiousBell loaded; heal+quick items only")
+    end
+end
+
 local function setBossFightMusicStage(stage)
     local audio = U.gameInstanceSubsystem("PBZPersistentAudioSubsystem")
     if audio then
@@ -1170,8 +1316,63 @@ local function livingBossNear(center, radius)
     return best
 end
 
--- 拳痴：铁狂 etc.: class-matched AISpawner stays soft; ClaimSeqSpawn the Seq* family
--- (minions like LuanShi_Seq030 / RenTuZi_Ice) so the encounter loads the real boss.
+-- 拳痴：铁狂 fights when the player drops into the clearing. ClaimSeq on RenTuZi_Ice alone
+-- never loads BP_Monster_LuanShi. Only poke the family MobGroup + nearest MobDomain —
+-- never ActivateAllGroups / LevelSequence:Play (those hard-crash).
+local function pulseSeqEncounterTriggers(center, familyName)
+    local pawn = U.playerPawn()
+    if not U.valid(pawn) or not center then return end
+
+    for _, s in ipairs(Data.findSeqFamilySpawners(st.boss) or {}) do
+        local group = nil
+        pcall(function() group = s.MobGroup end)
+        if U.valid(group) then
+            pcall(function() group:Activate() end)
+            pcall(function() group:OnActorEnterDomain(pawn) end)
+            U.log("seq family: MobGroup:Activate from %s", spawnerId(s))
+        end
+    end
+
+    local best, bestDist = nil, math.huge
+    for _, cn in ipairs({ "BP_MobDomain_C", "MobDomain" }) do
+        for _, d in ipairs(FindAllOf(cn) or {}) do
+            local loc = U.location(d)
+            if U.valid(d) and loc then
+                local dist = U.dist(loc, center)
+                if dist < bestDist and dist <= 12000 then
+                    best, bestDist = d, dist
+                end
+            end
+        end
+    end
+    if U.valid(best) then
+        pcall(function() best:OnTriggerEnteredEvent(pawn) end)
+        if familyName and familyName ~= "" then
+            pcall(function() best:ActivateGroup(familyName) end)
+        end
+        U.log("seq family: pulsed nearest MobDomain dist=%.0f %s", bestDist, U.fullName(best))
+    end
+end
+
+local function adoptSeqFamilyBoss(boss)
+    if not (U.valid(boss) and not isDead(boss)) then return false end
+    if not bossLocUsable(U.location(boss)) then
+        if not rescueSoftBossToPlayer(boss) then return false end
+        boss = bossPawn() or boss
+    end
+    if Config.LoadingCurtain ~= false then Curtain.cover() end
+    setBoss(boss)
+    st.spawnerLoc = U.location(boss) or st.seqFamilyLoc
+    st.frozenKey, st.frozenClass = st.bossKey, st.bossClass
+    hardFreezeBoss(boss)
+    placePlayerNearBoss()
+    dismissEarlyNextStage()
+    st.revealArmed = false
+    setPhase("preparing")
+    loadingToast("就位中…")
+    return true
+end
+
 local function tickSeqFamilyLocating()
     local familyName = Data.bossSeqFamily and Data.bossSeqFamily(st.boss)
     if not familyName then return false end
@@ -1180,7 +1381,6 @@ local function tickSeqFamilyLocating()
     if not st.seqFamilyStarted then
         local family = Data.findSeqFamilySpawners(st.boss)
         if #family == 0 then
-            -- Still near the seeded ground spot; wait for streaming to reveal Seq* actors.
             if not st.seqFamilyWaitLogged then
                 st.seqFamilyWaitLogged = true
                 U.log("seq family %s: no ground spawners yet near arena", familyName)
@@ -1194,7 +1394,22 @@ local function tickSeqFamilyLocating()
             end
             return false
         end
-        local anchor = U.location(family[1])
+        local anchor = nil
+        for _, s in ipairs(family) do
+            local loc = U.location(s)
+            if loc and U.saneWorldLoc(loc) then
+                anchor = loc
+                break
+            end
+        end
+        if not anchor then
+            local arena = Data.arena(st.boss.id)
+            if arena and arena.x then
+                anchor = { X = arena.x, Y = arena.y, Z = arena.z }
+            else
+                anchor = U.location(family[1])
+            end
+        end
         st.seqFamilyLoc = anchor
         st.seqFamilyStarted = true
         st.seqFamilyAt = os.clock()
@@ -1212,6 +1427,7 @@ local function tickSeqFamilyLocating()
                 pcall(function() s:Spawn() end)
             end
         end
+        pulseSeqEncounterTriggers(anchor, familyName)
         return true
     end
 
@@ -1227,18 +1443,13 @@ local function tickSeqFamilyLocating()
     end
 
     local living = livingBossNear(st.seqFamilyLoc)
-    if living then
-        U.log("seq family: living boss appeared after ClaimSeqSpawn")
-        if Config.LoadingCurtain ~= false then Curtain.cover() end
-        setBoss(living)
-        st.spawnerLoc = U.location(living)
-        st.frozenKey, st.frozenClass = st.bossKey, st.bossClass
-        hardFreezeBoss(living)
-        placePlayerNearBoss()
-        dismissEarlyNextStage()
-        st.revealArmed = false
-        setPhase("preparing")
-        loadingToast("就位中…")
+    if living and adoptSeqFamilyBoss(living) then
+        U.log("seq family: living boss near arena")
+        return true
+    end
+    local raw = findLivingBossRaw()
+    if raw and adoptSeqFamilyBoss(raw) then
+        U.log("seq family: living boss (raw/soft) adopted")
         return true
     end
 
@@ -1248,7 +1459,9 @@ local function tickSeqFamilyLocating()
             local family = Data.findSeqFamilySpawners(st.boss)
             for _, s in ipairs(family) do
                 if spawnerLooksSequenced(s) then trySequenceSpawn(s) end
+                pcall(function() s:Spawn() end)
             end
+            pulseSeqEncounterTriggers(st.seqFamilyLoc, familyName)
             if st.seqFamilyLoc then Streaming.moveTo(st.seqFamilyLoc) end
         end
         return true
@@ -1323,13 +1536,14 @@ local function tickLocating()
     if not settled and elapsed() < LOCATE_TIMEOUT_S then return end
     -- Known boss spot: one short hop next to it, instead of scanning every bell on the map.
     if not st.finalHop and hopToCachedArena() then return end
-    local spawner = findBossSpawner()
-    if spawner then return onSpawnerFound(spawner) end
 
-    -- Ground sequence family (拳痴：铁狂): ClaimSeqSpawn Seq* minions, wait for boss class.
+    -- 拳痴：铁狂 etc.: MobDomain / Seq* family before class-matched spawner (often missing).
     if Data.bossSeqFamily and Data.bossSeqFamily(st.boss) then
         if tickSeqFamilyLocating() then return end
     end
+
+    local spawner = findBossSpawner()
+    if spawner then return onSpawnerFound(spawner) end
 
     -- skyInvalid without usable Z: ground scanning will never find the pocket spawner.
     if Data.isSkyArenaBoss and Data.isSkyArenaBoss(st.boss) then
@@ -1472,22 +1686,27 @@ placePlayerNearBoss = function()
 end
 
 -- If the encounter sequence left the boss outside the fight volume, pull it next to the player.
--- Never pull a sky-arena boss down — send the player up instead.
+-- Never pull a real sky-arena boss down — send the player up instead.
+-- Soft junk locs (Z≈2e6) are rescued onto the player's ground footing.
 local function pullBossToPlayer()
     local pawn = U.playerPawn()
-    local boss = bossPawn()
+    local boss = bossPawn() or findLivingBossRaw()
     local p = U.location(pawn)
-    local b = U.location(boss)
-    if not U.valid(boss) or not p or not b then return false end
+    local b = boss and U.location(boss)
+    if not U.valid(boss) or not p then return false end
     if U.isSkyArenaLoc(b) then
+        setBoss(boss)
         return placePlayerNearBoss()
     end
-    if not U.saneWorldLoc(p) or not U.saneWorldLoc(b) then
-        U.log("pullBossToPlayer skipped: player=%s boss=%s",
-            tostring(U.saneWorldLoc(p)), tostring(U.saneWorldLoc(b)))
+    if not U.saneWorldLoc(p) then
+        U.log("pullBossToPlayer skipped: player loc bad")
         return false
     end
+    if not b or not U.saneWorldLoc(b) then
+        return rescueSoftBossToPlayer(boss)
+    end
     if U.dist(p, b) <= PLACE_NEAR_DISTANCES[#PLACE_NEAR_DISTANCES] then
+        setBoss(boss)
         faceEachOther(pawn, boss)
         return true
     end
@@ -1503,6 +1722,7 @@ local function pullBossToPlayer()
     local ok, moved = pcall(function() return boss:K2_TeleportTo(xf.Translation, rot) end)
     U.log("pull boss to player ok=%s moved=%s distWas=%.0f", tostring(ok), tostring(moved), U.dist(p, b))
     if ok and moved then
+        setBoss(boss)
         st.spawnerLoc = xf.Translation
         setFrozen(boss, true)
         faceEachOther(pawn, boss)
@@ -1515,6 +1735,9 @@ local function tickSpawning()
     local spawner = U.live(st.spawnerClass, st.spawnerKey)
     local ai = nil
     if spawner then pcall(function() ai = spawner.SpawnedAI end) end
+    if not (U.valid(ai) and not isDead(ai)) then
+        ai = findLivingBossRaw()
+    end
     if U.valid(ai) and not isDead(ai) then
         setBoss(ai)
         -- Hold black until freeze + place + streaming settle, then reveal into countdown.
@@ -1527,6 +1750,10 @@ local function tickSpawning()
         if U.teleportAllowedLoc(bloc) then
             st.spawnerLoc = bloc
             Data.rememberArenaLoc(st.rootBoss or st.boss, bloc, st.spawnerId)
+        else
+            -- Soft / junk Z: pull boss to the player before placePlayerNearBoss.
+            rescueSoftBossToPlayer(ai)
+            ai = bossPawn() or ai
         end
         local placed = placePlayerNearBoss()
         if not placed then pullBossToPlayer() end
@@ -1594,11 +1821,16 @@ local function beginFight()
     if st.phase ~= "countdown" then return end
     U.log("beginFight (%s sky=%s)", st.boss and st.boss.id or "?", tostring(st.skyArenaHop))
     dismissEarlyNextStage()
-    local boss = bossPawn() or reacquireBoss()
-    if boss then
-        setBoss(boss)
-        st.frozenKey, st.frozenClass = st.bossKey, st.bossClass
+    local boss = bossPawn()
+    if boss and isDead(boss) then boss = nil end
+    if not boss then boss = reacquireBoss() end
+    if not boss then boss = respawnBossForRematch() or reacquireBoss() end
+    if not (boss and not isDead(boss) and bossLocUsable(U.location(boss))) then
+        U.log("beginFight: no living boss after countdown, aborting")
+        return abort("Boss 未能刷出，挑战结束")
     end
+    setBoss(boss)
+    st.frozenKey, st.frozenClass = st.bossKey, st.bossClass
     -- Do not teleport again here — placement already happened once before countdown.
     faceEachOther(U.playerPawn(), boss)
     unfreezeBoss()
@@ -1607,6 +1839,7 @@ local function beginFight()
     st.bossDied = false
     st.playerDied = false
     st.missingBossSince = nil
+    st.victoryRematchSpawn = nil
     -- After a death-rematch the engine may briefly lose the boss handle; don't false-victory.
     -- Real kills still win (grace only helps when a living boss can be reacquired).
     if st.rematchAfterDefeat then
@@ -1645,14 +1878,40 @@ end
 -- The boss stays frozen behind the black screen until the world around it has finished streaming in.
 local function tickPreparing()
     local boss = bossPawn()
-    if boss and not bossLocUsable(U.location(boss)) then boss = nil end
+    if boss and isDead(boss) then boss = nil end
+    if boss and not bossLocUsable(U.location(boss)) then
+        if rescueSoftBossToPlayer(boss) then
+            boss = bossPawn() or boss
+        else
+            boss = nil
+        end
+    end
     if not boss then boss = reacquireBoss() end
+    if not boss then
+        local raw = findLivingBossRaw()
+        if raw then
+            if bossLocUsable(U.location(raw)) then
+                setBoss(raw)
+                boss = raw
+            elseif rescueSoftBossToPlayer(raw) then
+                boss = bossPawn() or raw
+            end
+        end
+    end
+    -- Post-victory rematch: never adopt the corpse; keep ClaimSeqSpawn until a living AI appears.
+    if (not boss or isDead(boss)) and st.victoryRematchSpawn then
+        if not st.victorySpawnAt or (os.clock() - st.victorySpawnAt) >= 0.8 then
+            st.victorySpawnAt = os.clock()
+            boss = respawnBossForRematch()
+            U.log("preparing: victoryRematchSpawn retry")
+        end
+    end
     -- SpawnedAI can report a soft (0,0,0) shell for a beat after the player hops in
     -- (seen with 追命：六绝凶镰 → instant "Boss 加载失败" while cleanup still found a living AI).
     if not boss and elapsedS() >= 1.0 then
         boss = ensureBossForRematch()
     end
-    if not boss then
+    if not boss or isDead(boss) then
         if elapsed() < PREPARE_TIMEOUT_S then
             if not st.prepareMissingLogged then
                 st.prepareMissingLogged = true
@@ -1660,9 +1919,15 @@ local function tickPreparing()
             end
             return
         end
+        st.victoryRematchSpawn = nil
         return abort("Boss 加载失败")
     end
+    st.victoryRematchSpawn = nil
     st.prepareMissingLogged = nil
+    if st.rematchAfterDefeat and not st.playerHealedForRematch then
+        st.playerHealedForRematch = true
+        restorePlayerFullHealth()
+    end
     -- The freeze slot is keyed by pawn + controller, so a reattached controller already gets a
     -- full pass. Forcing one every tick re-ran StopAI / PauseLogic / StopMovement 3x a second.
     if not controllerOf(boss) then
@@ -1705,10 +1970,13 @@ end
 
 local function tickCountdown()
     local boss = bossPawn()
-    if not boss or not bossLocUsable(U.location(boss)) then
+    if not boss or isDead(boss) or not bossLocUsable(U.location(boss)) then
         boss = reacquireBoss()
     end
-    if boss then
+    if (not boss or isDead(boss)) and st.rematchAfterDefeat then
+        boss = respawnBossForRematch() or reacquireBoss()
+    end
+    if boss and not isDead(boss) then
         -- No AI controller ⇒ previous freeze was a soft shell; force full StopAI pass.
         if not controllerOf(boss) then
             hardFreezeBoss(boss)
@@ -1936,11 +2204,88 @@ local function showBossKillBanner(useRed)
     return pushBossDeadFallback(useRed)
 end
 
+-- Victory rematch (optional PostFightChoice): MUST ClaimSeqSpawn a fresh boss.
+-- After「斩」the old SpawnedAI often still reports IsDead=false for a beat; reusing it
+-- freezes a corpse that then vanishes during countdown (seen with 新娘阿花).
+local function rematchAfterVictory()
+    if st.phase ~= "choosing" and st.phase ~= "fighting" then
+        U.log("rematchAfterVictory ignored (phase=%s)", tostring(st.phase))
+        return
+    end
+    EndChoice.hide()
+    clearBossDeadWidgets()
+    st.bossDied = false
+    st.playerDied = false
+    st.fightGraceUntil = nil
+    st.missingBossSince = nil
+    st.countdownId = nil
+    st.prepareRevealId = nil
+    st.playerPlaced = false
+    st.revealArmed = false
+    st.rematchAfterDefeat = true
+    st.victoryRematchSpawn = true
+    st.playerHealedForRematch = nil
+    st.bossKey, st.bossClass = nil, nil
+    st.frozenKey, st.frozenClass = nil, nil
+    Toast.show("再次迎战：" .. ((st.rootBoss or st.boss).name or ""), 3000)
+    U.log("post-fight rematch: force respawn + countdown")
+    if Config.LoadingCurtain ~= false then Curtain.cover() end
+    setPlayerTransitFrozen(true)
+
+    U.delay(200, "challenge.victoryRematch", function()
+        if st.phase == "ending" or st.phase == "reloading" or st.phase == "idle" then return end
+        local boss = respawnBossForRematch()
+        if not (boss and not isDead(boss) and bossLocUsable(U.location(boss))) then
+            -- Sequence spawn can lag; preparing will keep retrying while victoryRematchSpawn.
+            U.log("victory rematch: spawn not ready yet, entering preparing to retry")
+            setPhase("preparing")
+            loadingToast("刷出 Boss…")
+            return
+        end
+        st.victoryRematchSpawn = nil
+        restoreActorFullHealth(boss)
+        hardFreezeBoss(boss)
+        st.frozenKey, st.frozenClass = st.bossKey, st.bossClass
+        restorePlayerFullHealth()
+        st.playerPlaced = false
+        placePlayerNearBoss()
+        faceEachOther(U.playerPawn(), boss)
+        setPhase("preparing")
+    end)
+end
+
 local function victory()
     showBossKillBanner(false)
     local name = (st.rootBoss or st.boss).name
-    Toast.show("挑战成功：" .. name .. "，即将返回", Config.VictoryReturnDelayMs)
-    returnToStart("victory", Config.VictoryReturnDelayMs)
+    -- Default (F8 off): same as before — toast then restore saves / return to bell.
+    if not EndChoice.isEnabled() then
+        Toast.show("挑战成功：" .. name .. "，即将返回", Config.VictoryReturnDelayMs)
+        return returnToStart("victory", Config.VictoryReturnDelayMs)
+    end
+
+    Toast.show("挑战成功：" .. name, 3000)
+    setPhase("choosing")
+    unfreezeBoss()
+    setPlayerTransitFrozen(false)
+    local delayMs = math.max(500, tonumber(Config.PostFightChoiceDelayMs) or 2500)
+    local token = os.clock()
+    st.choiceToken = token
+    U.log("post-fight choice armed in %dms", delayMs)
+    U.delay(delayMs, "challenge.postFightChoice", function()
+        if st.phase ~= "choosing" or st.choiceToken ~= token then return end
+        local ok = EndChoice.show({
+            bossName = name,
+            onRematch = rematchAfterVictory,
+            onQuit = function()
+                Toast.show("退出挑战，正在返回出发铃铛…", 3000)
+                returnToStart("victory", 800)
+            end,
+        })
+        if not ok then
+            Toast.show("挑战成功：" .. name .. "，即将返回", Config.VictoryReturnDelayMs)
+            returnToStart("victory", Config.VictoryReturnDelayMs)
+        end
+    end)
 end
 
 local function livePawnOf(boss)
@@ -2236,6 +2581,7 @@ rematchOnDefeat = function()
         st.countdownId = nil
         st.prepareRevealId = nil
         st.rematchAfterDefeat = true
+        st.playerHealedForRematch = nil
         st.frozenKey, st.frozenClass = st.bossKey, st.bossClass
         hardFreezeBoss(boss)
         local bloc = U.location(boss)
@@ -2274,7 +2620,7 @@ rematchOnDefeat = function()
         U.log("defeat respawn ok=%s moved=%s at (%.0f, %.0f, %.0f)",
             tostring(ok), tostring(moved), dest.X, dest.Y, dest.Z)
 
-        restoreActorFullHealth(pawn)
+        restorePlayerFullHealth()
         hardFreezeBoss(boss)
         faceEachOther(pawn, boss)
         st.defeatRetrying = false
@@ -2555,7 +2901,14 @@ function M.tick()
         end
         return
     end
-    Curtain.hold()
+    -- Camera fade during WP transition hard-crashes; only re-hold when streaming is idle
+    -- (or outside travel/reload phases).
+    if Curtain.holdAllowed() then
+        local transit = (p == "traveling" or p == "departing" or p == "reloading")
+        if (not transit) or Streaming.idle() then
+            Curtain.hold()
+        end
+    end
     if p == "traveling" then tickTraveling()
     elseif p == "locating" then tickLocating()
     elseif p == "scanning" then tickScanning()
@@ -2564,6 +2917,7 @@ function M.tick()
     elseif p == "countdown" then tickCountdown()
     elseif p == "fighting" then tickFighting()
     elseif p == "transition" then tickTransition()
+    elseif p == "choosing" then EndChoice.tick()
     elseif p == "reloading" then tickReloading()
     elseif p == "landing" then tickLanding()
     end
@@ -2627,6 +2981,7 @@ end
 function M.forceEnd(reason)
     if st.phase == "idle" or st.phase == "ending" or st.phase == "reloading" then return end
     if st.phase == "landing" then return completeReturn() end
+    EndChoice.hide()
     U.log("force end: %s", tostring(reason))
     Toast.show("宿敌再战出错，正在返回", 4000)
     returnToStart("error", 1500)
@@ -2635,14 +2990,20 @@ end
 function M.quit()
     if st.phase == "idle" then return end
     if st.phase == "ending" or st.phase == "reloading" or st.phase == "landing" then return end
-    -- Cancel defeat-rematch timers so they cannot restart the fight after quit.
+    -- Cancel defeat-rematch / post-fight choice timers so they cannot restart after quit.
+    EndChoice.hide()
     st.playerDied = false
     st.defeatRetrying = false
     st.defeatUiWaitAt = nil
     st.countdownId = nil
     st.prepareRevealId = nil
+    st.choiceToken = nil
     Toast.show("退出挑战，正在返回出发铃铛…", 3000)
     returnToStart("quit", 800)
+end
+
+function M.togglePostFightChoice()
+    return EndChoice.toggle()
 end
 
 function M.killBoss()

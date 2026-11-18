@@ -5,9 +5,11 @@ local Config = require("config")
 local Data = require("gamedata")
 local BellUI = require("bellui")
 local QuitUI = require("quitui")
+local EndChoice = require("endchoice")
 local Challenge = require("challenge")
 local Save = require("savesnap")
 local Streaming = require("streaming")
+local Curtain = require("curtain")
 local TICK_MS = 300
 local LEARN_INTERVAL_S = 30
 
@@ -42,10 +44,15 @@ local worldKey = nil
 local function forgetStaleWidgets()
     local key = U.worldName() .. "|" .. tostring(U.address(U.playerController()))
     if key == worldKey then return end
-    if worldKey then U.log("world changed, dropping widget references") end
+    if worldKey then
+        U.log("world changed, dropping widget references")
+        -- Camera fade during WP transition hard-crashes (seen on 拳痴 cross-map travel).
+        Curtain.blockHold(3.0)
+    end
     worldKey = key
     BellUI.reset()
     QuitUI.reset()
+    EndChoice.reset()
     Toast.reset()
     Streaming.forget()
 end
@@ -58,7 +65,7 @@ LoopAsync(TICK_MS, function()
         BellUI.tick(not Challenge.isActive())
         -- 退出挑战 row under the System > 退出游戏 list while a rematch is running.
         local p = Challenge.phase()
-        QuitUI.tick(Challenge.isActive() and p ~= "ending" and p ~= "reloading" and p ~= "landing")
+        QuitUI.tick(Challenge.isActive() and p ~= "ending" and p ~= "reloading" and p ~= "landing" and p ~= "choosing")
         tickChallenge()
         if not Challenge.isActive() and os.time() - lastLearnAt >= LEARN_INTERVAL_S and U.playerPawn() and Streaming.idle() then
             lastLearnAt = os.time()
@@ -75,6 +82,7 @@ end
 
 tryHook("/Script/CommonUI.CommonButtonBase:HandleButtonClicked", function(self)
     local w = self:get()
+    if EndChoice.handleClick(w) then return end
     if QuitUI.handleClick(w) then return end
     BellUI.handleClick(w)
 end)
@@ -82,12 +90,15 @@ end)
 -- Gamepad Confirm often lands here instead of (or before) HandleButtonClicked.
 tryHook("/Script/CommonUI.CommonButtonBase:HandleTriggeringActionCommited", function(self)
     local w = self:get()
+    if EndChoice.handleClick(w) then return end
     if QuitUI.handleClick(w) then return end
     BellUI.handleClick(w)
 end)
 
 tryHook("/Script/CommonUI.CommonButtonBase:HandleFocusReceived", function(self)
-    BellUI.onButtonFocused(self:get())
+    local w = self:get()
+    if EndChoice.onButtonFocused(w) then return end
+    BellUI.onButtonFocused(w)
 end)
 
 tryHook("/Script/ProjectPBZ.PBZSaveLoadSubsystem:OnSaveGameFinished", function(self, slotName)
@@ -115,6 +126,7 @@ end)
 RegisterLoadMapPostHook(function()
     BellUI.reset()
     QuitUI.reset()
+    EndChoice.reset()
     Toast.reset()
     U.gameThread("onMapLoaded", function() Challenge.onMapLoaded() end)
     lastLearnAt = os.time() - LEARN_INTERVAL_S + 10
@@ -133,6 +145,9 @@ bindKey(Config.ExitKey, function() Challenge.quit() end)
 if Config.EnableKillKey then
     bindKey(Config.KillKey, function() Challenge.killBoss() end)
 end
+bindKey(Config.PostFightChoiceToggleKey or "F8", function()
+    Challenge.togglePostFightChoice()
+end)
 
 U.gameThread("recover", function() Challenge.recoverIfNeeded() end)
 
