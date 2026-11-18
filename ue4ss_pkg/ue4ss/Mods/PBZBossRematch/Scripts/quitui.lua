@@ -14,6 +14,7 @@
 local U = require("util")
 local Config = require("config")
 local Toast = require("toast")
+local L = require("locale")
 
 local M = {}
 
@@ -425,7 +426,7 @@ local function injectRow(info)
         U.log("quitui row: could not assign the action setting; not using the row")
         return false
     end
-    local label = Config.ExitLabel or "退出挑战"
+    local label = L.exitLabel()
     pcall(function() entry:OnSettingAssigned(FText(label)) end)
     setRowLabel(entry, label)
 
@@ -541,7 +542,7 @@ local function ensureButton()
     end
     buttonKey = U.address(btn)
     place(btn)
-    local label = Config.ExitLabel or "退出挑战"
+    local label = L.exitLabel()
     Toast.setLabel(btn, label)
     U.delay(50, "quitui.label", function()
         local live = liveBtn()
@@ -557,7 +558,7 @@ local function keepRow()
     end
     -- The entry's blueprint may refill the caption from its (empty) setting.
     local entry = U.live(row.entryClass, row.entryKey)
-    local label = Config.ExitLabel or "退出挑战"
+    local label = L.exitLabel()
     if entry then
         local s = ""
         pcall(function() s = entry.Text_SettingName:GetText():ToString() end)

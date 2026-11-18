@@ -9,6 +9,7 @@ local EndChoice = require("endchoice")
 local Challenge = require("challenge")
 local Save = require("savesnap")
 local Streaming = require("streaming")
+local Locale = require("locale")
 local Curtain = require("curtain")
 local TICK_MS = 300
 local LEARN_INTERVAL_S = 30
@@ -48,6 +49,7 @@ local function forgetStaleWidgets()
         U.log("world changed, dropping widget references")
         -- Camera fade during WP transition hard-crashes (seen on 拳痴 cross-map travel).
         Curtain.blockHold(3.0)
+        Locale.refresh()
     end
     worldKey = key
     BellUI.reset()
@@ -151,4 +153,5 @@ end)
 
 U.gameThread("recover", function() Challenge.recoverIfNeeded() end)
 
-U.log("PBZBossRematch loaded")
+Locale.refresh()
+U.log("PBZBossRematch loaded (lang=%s culture=%s)", Locale.code(), Locale.culture())

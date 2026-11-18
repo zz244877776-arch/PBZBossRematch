@@ -205,6 +205,56 @@ local function collectSoftClassPaths(arr)
     return list
 end
 
+local function flowLocParts(flow)
+    local ns, key, cache = "", "", ""
+    if flow == nil then return ns, key, cache end
+    pcall(function() ns = U.str(flow.Namespace) end)
+    pcall(function() key = U.str(flow.Key) end)
+    pcall(function() cache = U.str(flow.ValueCache) end)
+    if ns == "None" then ns = "" end
+    if key == "None" then key = "" end
+    if cache == "None" then cache = "" end
+    return ns, key, cache
+end
+
+-- Prefer the game's loc table (same path as map names). ValueCache / Hans are often
+-- baked Chinese even when the client language is English.
+local function resolveFlowLocName(ns, key, cache, hansFallback)
+    if key ~= "" and M.LocResolver then
+        local ok, s = pcall(M.LocResolver, ns or "", key)
+        if ok and s and s ~= "" then
+            pcall(function() require("locale").observeText(s) end)
+            return s, "lockey"
+        end
+    end
+    if cache ~= "" then return cache, "cache" end
+    if hansFallback and hansFallback ~= "" then return hansFallback, "hans" end
+    return "", "none"
+end
+
+function M.clearBossRows()
+    bossRows = nil
+    mapNames = {}
+    usedNames = {}
+end
+
+-- Re-resolve boss display names after LocResolver is ready / language changes.
+function M.refreshBossNames()
+    if not bossRows then return 0 end
+    local n = 0
+    for _, b in ipairs(bossRows) do
+        local name, src = resolveFlowLocName(b.nameNs, b.nameKey, b.nameCache, b.nameHans)
+        if name ~= "" and name ~= b.name then
+            b.name = name
+            n = n + 1
+        elseif name ~= "" then
+            b.name = name
+        end
+        b.nameSource = src
+    end
+    return n
+end
+
 function M.bosses()
     if bossRows then return bossRows end
     local rows = {}
@@ -214,13 +264,21 @@ function M.bosses()
             local classPath = softClassPathFrom(row.EnemyClass)
             local class = classFromPath(classPath) or (id .. "_C")
             local replacedBy = softClassPathFrom(row.ReplacedByEnemyClass)
+            local ns, key, cache = flowLocParts(row.EnemyName)
+            local hans = U.str(row.Enemy_CH_Hans_Name)
+            local name, src = resolveFlowLocName(ns, key, cache, hans)
             table.insert(rows, {
                 id = id,
                 class = class,
                 classPath = classPath,
                 replacedByPath = (replacedBy ~= "" and replacedBy) or nil,
                 aliasPaths = collectSoftClassPaths(row.AliasEnemyClasses),
-                name = U.str(row.Enemy_CH_Hans_Name),
+                name = name ~= "" and name or id,
+                nameNs = ns,
+                nameKey = key,
+                nameCache = cache,
+                nameHans = hans,
+                nameSource = src,
                 map = U.str(row.OwnMapID),
                 order = tonumber(U.str(row.DisplayOrder)) or 0,
                 hidden = isHidden(id),
@@ -230,11 +288,12 @@ function M.bosses()
     table.sort(rows, function(a, b) return a.order < b.order end)
     if #rows > 0 then
         bossRows = rows
-        local withPath = 0
+        local withPath, withLockey = 0, 0
         for _, b in ipairs(rows) do
             if b.classPath and b.classPath ~= "" then withPath = withPath + 1 end
+            if b.nameSource == "lockey" then withLockey = withLockey + 1 end
         end
-        U.log("codex bosses loaded: %d (classPath=%d)", #rows, withPath)
+        U.log("codex bosses loaded: %d (classPath=%d nameLockey=%d)", #rows, withPath, withLockey)
     end
     -- A second phase is reached through its first phase; one without a first phase on its map is a fight of its own.
     local chained = {}
@@ -421,6 +480,9 @@ function M.mapDisplayName(mapId)
     U.log("map name %s -> %s via %s (key %s/%s)", mapId, name ~= "" and name or "<none>", source,
         row and row.ns or "?", row and row.key or "?")
     if name == "" then return mapId end
+    if source == "lockey" then
+        pcall(function() require("locale").observeText(name) end)
+    end
     if usedNames[name] and usedNames[name] ~= mapId then
         name = name .. "·" .. mapId
     end
@@ -872,6 +934,8 @@ end
 -- ===== List shown in the bell menu =====
 
 function M.availableBossesByMap()
+    -- LocResolver (bell UI scratch widget) is often ready only after the menu opens.
+    M.refreshBossNames()
     local discovered = Config.OnlyDiscovered and M.discoveredClasses() or nil
     local byMap, mapOrder = {}, {}
     for _, b in ipairs(M.bosses()) do

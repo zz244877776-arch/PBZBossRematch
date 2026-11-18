@@ -2,6 +2,7 @@ local U = require("util")
 local Config = require("config")
 local Data = require("gamedata")
 local Toast = require("toast")
+local L = require("locale")
 
 local M = {}
 
@@ -28,6 +29,7 @@ local poolKeys = {}      -- our list buttons, kept in MainBox and reused
 local hiddenKeys = {}    -- { key = address, vis = visibility } of original entries hidden by the list
 local buttonActions = {}
 local listKeys = {}      -- ordered keys for map / boss list
+local locScratchKey = nil -- single hidden DialogueButton reused by LocResolver
 
 local function isActivated(m)
     local ok, v = pcall(function() return m:IsActivated() end)
@@ -45,6 +47,7 @@ function M.reset()
     menuKey, entryKey = nil, nil
     poolKeys, hiddenKeys, buttonActions = {}, {}, {}
     listKeys = {}
+    locScratchKey = nil
 end
 
 local function childrenOf(box)
@@ -71,32 +74,65 @@ end
 -- ===== Localized map names =====
 
 local locCache = {}
+-- One hidden scratch button reused for every loc lookup. Creating a fresh W_DialogueButton
+-- per boss/map key (~75+) while the bell menu is open hard-crashes CommonUI.
 
--- Resolves a localization key by letting one of the game's rich text blocks look it up. The helper
--- widget has no parent and is collected by the engine soon after, so it is never reused.
-local function resolveLocKey(ns, key)
-    local cacheKey = ns .. "/" .. key
-    if locCache[cacheKey] ~= nil then return locCache[cacheKey] or nil end
+local function liveLocScratch()
+    return locScratchKey and U.live(BUTTON_CLASS, locScratchKey) or nil
+end
+
+local function ensureLocScratch()
+    local scratch = liveLocScratch()
+    if scratch then return scratch end
+    locScratchKey = nil
     if not U.valid(Toast.ButtonClass) then return nil end
     local pc = U.playerController()
     local wbl = StaticFindObject("/Script/UMG.Default__WidgetBlueprintLibrary")
-    local ok, scratch = pcall(function() return wbl:Create(pc, Toast.ButtonClass, pc) end)
-    if not ok or not U.valid(scratch) then return nil end
+    local menu = liveMenu(false)
+    local outer = menu or pc
+    local ok, w = pcall(function() return wbl:Create(outer, Toast.ButtonClass, pc) end)
+    if not ok or not U.valid(w) then return nil end
+    -- Keep it out of layout / input; do not AddChild to MainBox.
+    pcall(function() w:SetVisibility(VIS_COLLAPSED) end)
+    pcall(function() w:UnbindTriggeringInputActionToClick() end)
+    locScratchKey = U.address(w)
+    return w
+end
+
+-- Resolves a localization key by letting one of the game's rich text blocks look it up.
+local function resolveLocKey(ns, key)
+    local cacheKey = tostring(ns or "") .. "/" .. tostring(key or "")
+    if locCache[cacheKey] ~= nil then return locCache[cacheKey] or nil end
+    local scratch = ensureLocScratch()
+    if not scratch then return nil end
     local rt = scratch.PBZCommonLocRichText_39
     if not U.valid(rt) then return nil end
     local result = false
-    for _, k in ipairs({ key, ns .. "/" .. key, ns .. "." .. key }) do
-        pcall(function() rt:SetText(FText("")) end)
-        pcall(function() rt:SetTextByLocKey(k) end)
-        local s = ""
-        pcall(function() s = rt:GetText():ToString() end)
-        if s ~= "" and s ~= k and s ~= key then
-            result = s
-            break
+    local tries = { key }
+    if ns and ns ~= "" then
+        table.insert(tries, ns .. "/" .. key)
+        table.insert(tries, ns .. "." .. key)
+    end
+    for _, k in ipairs(tries) do
+        if k and k ~= "" then
+            pcall(function() rt:SetText(FText("")) end)
+            pcall(function() rt:SetTextByLocKey(k) end)
+            local s = ""
+            pcall(function() s = rt:GetText():ToString() end)
+            if s ~= "" and s ~= k and s ~= key and s ~= (ns .. "/" .. key) and s ~= (ns .. "." .. key) then
+                result = s
+                break
+            end
         end
     end
     locCache[cacheKey] = result
     return result or nil
+end
+
+function M.clearLocCache()
+    locCache = {}
+    -- Keep the scratch widget; only drop the address if the object is already gone.
+    if locScratchKey and not liveLocScratch() then locScratchKey = nil end
 end
 
 Data.LocResolver = resolveLocKey
@@ -388,8 +424,8 @@ local function showBossList(mapId, bosses)
     for _, b in ipairs(bosses) do
         local arena = Data.arena(b.id)
         local suffix = ""
-        if not arena then suffix = "（未勘察）"
-        elseif arena.unsupported then suffix = "（暂不支持）" end
+        if not arena then suffix = L.T("not_scouted_tag")
+        elseif arena.unsupported then suffix = L.T("unsupported_tag") end
         table.insert(entries, {
             label = b.name .. suffix,
             action = function()
@@ -400,25 +436,41 @@ local function showBossList(mapId, bosses)
             end,
         })
     end
-    table.insert(entries, { label = "返回", action = function() showMapList() end })
+    table.insert(entries, { label = L.T("back"), action = function() showMapList() end })
     buildList(entries)
 end
 
 showMapList = function()
+    -- Rebuild boss rows so lockey names refresh; keep locCache / single scratch widget
+    -- (wiping the cache forced ~75 DialogueButton Creates and crashed CommonUI).
+    Data.clearBossRows()
     local byMap, order = Data.availableBossesByMap()
+    local sampleLogged = false
     local entries = {}
     for _, mapId in ipairs(order) do
         local bosses = byMap[mapId]
+        if not sampleLogged and bosses and bosses[1] then
+            local b = bosses[1]
+            U.log("boss name sample %s -> %s via %s (key %s/%s)",
+                b.id, tostring(b.name), tostring(b.nameSource),
+                tostring(b.nameNs), tostring(b.nameKey))
+            -- Only lockey text is a safe language signal (ValueCache/Hans are often Chinese).
+            if b.nameSource == "lockey" then
+                pcall(function() require("locale").observeText(b.name) end)
+            end
+            sampleLogged = true
+        end
+        local mapName = Data.mapDisplayName(mapId)
         table.insert(entries, {
-            label = string.format("%s（%d）", Data.mapDisplayName(mapId), #bosses),
+            label = L.T("map_count", mapName, #bosses),
             action = function() showBossList(mapId, bosses) end,
         })
     end
     if #entries == 0 then
-        Toast.show("没有可再战的 Boss", 3000)
+        Toast.show(L.T("no_challengable"), 3000)
         return
     end
-    table.insert(entries, { label = "返回", action = backToMenu })
+    table.insert(entries, { label = L.T("back"), action = backToMenu })
     buildList(entries)
 end
 
@@ -451,6 +503,26 @@ local function inject(m)
         return
     end
     Toast.ButtonClass = cls
+    -- Read already-localized vanilla button labels (no scratch-widget Create — that crashes).
+    pcall(function()
+        local samples = {}
+        for _, field in ipairs(MENU_BUTTON_FIELDS) do
+            local ok, w = pcall(function() return m[field] end)
+            if ok and U.valid(w) then
+                for _, tw in ipairs({ "PBZCommonLocRichText_39", "Selected" }) do
+                    local text = ""
+                    pcall(function() text = w[tw]:GetText():ToString() end)
+                    if text and text ~= "" then
+                        table.insert(samples, text)
+                        break
+                    end
+                end
+            end
+        end
+        local code = require("locale").observeMenuTexts(samples)
+        U.log("bell menu: locale from menu labels -> %s (%s) samples=%d",
+            tostring(code), tostring(require("locale").culture()), #samples)
+    end)
     ensureHoverHook()
     local entry = newButton(m)
     if not entry then
@@ -460,12 +532,12 @@ local function inject(m)
     addBeforeClose(m, entry)
     entryKey = U.address(entry)
     buttonActions[entryKey] = function() showMapList() end
-    setLabel(entry, Config.EntryLabel)
+    setLabel(entry, L.entryLabel())
     local function refresh()
         local mm = liveMenu(false)
         local e = mm and childMap(mm)[entryKey]
         if e then
-            setLabel(e, Config.EntryLabel)
+            setLabel(e, L.entryLabel())
             bindConfirm(e, findTemplateButton(mm))
         end
         relinkNavigation()

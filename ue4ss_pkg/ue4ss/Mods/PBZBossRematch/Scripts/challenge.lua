@@ -6,6 +6,7 @@ local Toast = require("toast")
 local Streaming = require("streaming")
 local Curtain = require("curtain")
 local EndChoice = require("endchoice")
+local L = require("locale")
 
 local M = {}
 
@@ -73,7 +74,7 @@ local function elapsedS() return os.clock() - (st.phaseClock or os.clock()) end
 -- One line under the black screen, so the loading does not look like a hang.
 local function loadingToast(stage)
     if not st.boss then return end
-    Toast.show(string.format("宿敌再战：%s  %s", st.boss.name, stage), 20000)
+    Toast.show(L.T("loading", st.boss.name, stage), 20000)
 end
 
 local function saveSub() return U.gameInstanceSubsystem("PBZSaveLoadSubsystem") end
@@ -619,7 +620,7 @@ local function returnToStart(reason, delayMs)
             if st.phase ~= "ending" then return end
             Save.exitVeto()
             if not Save.restoreFiles() then
-                Toast.show("存档恢复失败，请查看 rematch.log", 8000)
+                Toast.show(L.T("save_restore_fail"), 8000)
                 U.log("restore failed; state kept for recovery on next launch")
                 Curtain.reveal(0.5)
                 setPlayerTransitFrozen(false)
@@ -636,7 +637,7 @@ local function returnToStart(reason, delayMs)
             -- recovery on a later launch would otherwise delete saves made after this challenge.
             Save.clearState()
             if not Save.reloadSlot(slot) then
-                Toast.show("读档失败：存档已恢复，请手动回到主菜单读档", 8000)
+                Toast.show(L.T("reload_fail_manual"), 8000)
                 Curtain.reveal(0.5)
                 setPlayerTransitFrozen(false)
                 setPhase("idle")
@@ -678,12 +679,12 @@ end
 
 function M.start(boss)
     if M.isActive() then
-        Toast.show("已经在挑战中", 2000)
+        Toast.show(L.T("already_challenging"), 2000)
         return
     end
     local arena = Data.arena(boss.id)
     if arena and arena.unsupported then
-        Toast.show(boss.name .. " 暂不支持再战", 3000)
+        Toast.show(L.T("unsupported", boss.name), 3000)
         return
     end
     U.log("=== start challenge: %s (%s, map %s)", boss.name, boss.id, boss.map)
@@ -710,7 +711,7 @@ function M.start(boss)
     end
     local firstBell = arenaBell or firstSaneMapBell()
     if not firstBell then
-        Toast.show("找不到前往该地图的铃铛", 4000)
+        Toast.show(L.T("no_bell_for_map"), 4000)
         return
     end
     local mapLevel = Data.levelNameForMap(boss.map)
@@ -728,7 +729,7 @@ function M.start(boss)
         U.log("arena cache miss; first visit uses map bell %s (next time will be faster)", firstBell.id)
     end
     if not level then
-        Toast.show("找不到铃铛所在关卡", 4000)
+        Toast.show(L.T("no_bell_level"), 4000)
         return
     end
 
@@ -755,12 +756,12 @@ function M.start(boss)
 
     local ok, err = Save.takeSnapshot({ bossId = boss.id, bossName = boss.name, startBell = startBell, startWorld = U.worldName() })
     if not ok then
-        Toast.show("无法开始挑战：" .. tostring(err), 5000)
+        Toast.show(L.T("cannot_start", tostring(err)), 5000)
         return
     end
 
     st = { phase = "idle", boss = boss, level = level, mapBells = mapBells, startBell = startBell }
-    loadingToast(arenaBell and "前往中…" or "首次前往该地图，加载较慢…")
+    loadingToast(arenaBell and L.T("going") or L.T("first_visit_slow"))
     clearStickyCombatMusic()
 
     local transform = U.bellTravelTransform(firstBell) or firstBell.transform
@@ -813,7 +814,7 @@ local function arrived()
 end
 
 local function tickTraveling()
-    if elapsed() > TRAVEL_TIMEOUT_S then return abort("传送超时") end
+    if elapsed() > TRAVEL_TIMEOUT_S then return abort(L.T("travel_timeout")) end
     if Config.LoadingCurtain ~= false then setPlayerTransitFrozen(true) end
     if not arrived() then
         st.arrivedAt = nil
@@ -825,7 +826,7 @@ local function tickTraveling()
     local settle = st.travel.sameMap and SETTLE_SAME_MAP_S or SETTLE_CROSS_MAP_S
     if os.clock() - st.arrivedAt < settle then return end
     U.log("arrived after %.1fs", elapsedS())
-    if not st.travel.sameMap then loadingToast("加载 Boss…") end
+    if not st.travel.sameMap then loadingToast(L.T("loading_boss")) end
     setPhase("locating")
 end
 
@@ -1175,7 +1176,7 @@ local function startSpawn(spawner)
             spawned = ok
             if not spawned then spawned = trySequenceSpawn(spawner) end
         end
-        if not spawned then return abort("刷出 Boss 失败") end
+        if not spawned then return abort(L.T("spawn_failed")) end
     end
     activateEncounterSupport(st.spawnerLoc, spawner)
     st.altSpawnTried = false
@@ -1369,7 +1370,7 @@ local function adoptSeqFamilyBoss(boss)
     dismissEarlyNextStage()
     st.revealArmed = false
     setPhase("preparing")
-    loadingToast("就位中…")
+    loadingToast(L.T("positioning"))
     return true
 end
 
@@ -1414,7 +1415,7 @@ local function tickSeqFamilyLocating()
         st.seqFamilyStarted = true
         st.seqFamilyAt = os.clock()
         Streaming.moveTo(anchor)
-        loadingToast("触发序列擂台…")
+        loadingToast(L.T("triggering_seq"))
         U.log("seq family %s: ClaimSeqSpawn %d spawner(s) at (%.0f, %.0f, %.0f)",
             familyName, #family, anchor.X, anchor.Y, anchor.Z)
         for _, s in ipairs(family) do
@@ -1468,7 +1469,7 @@ local function tickSeqFamilyLocating()
     end
 
     Streaming.clear()
-    abort(st.boss.name .. " 序列擂台未能刷出 Boss")
+    abort(L.T("seq_arena_fail", st.boss.name))
     return true
 end
 
@@ -1481,7 +1482,7 @@ local function tickSkyLocating(skyLoc, arena)
         st.skyStreamStarted = true
         st.skyStreamAt = os.clock()
         Streaming.moveTo(skyLoc)
-        loadingToast("加载天空擂台…")
+        loadingToast(L.T("loading_sky"))
         U.log("sky locate: streaming pocket Z=%.0f bell=%s id=%s",
             skyLoc.Z, tostring(arena and arena.bell), st.boss.id)
         return
@@ -1515,7 +1516,7 @@ local function tickSkyLocating(skyLoc, arena)
             dismissEarlyNextStage()
             st.revealArmed = false
             setPhase("preparing")
-            loadingToast("就位中…")
+            loadingToast(L.T("positioning"))
             return
         end
     end
@@ -1523,7 +1524,7 @@ local function tickSkyLocating(skyLoc, arena)
     if elapsed() < SKY_LOCATE_TIMEOUT_S then return end
     Streaming.clear()
     -- Never markUnsupported: ground scans cannot see these spawners.
-    return abort(st.boss.name .. " 天空擂台未能加载（刷怪点未出现）")
+    return abort(L.T("sky_arena_fail", st.boss.name))
 end
 
 -- Objects in regions that are still loading or unloading must not be touched, so every
@@ -1547,7 +1548,7 @@ local function tickLocating()
 
     -- skyInvalid without usable Z: ground scanning will never find the pocket spawner.
     if Data.isSkyArenaBoss and Data.isSkyArenaBoss(st.boss) then
-        return abort(st.boss.name .. " 天空擂台坐标缺失，请先在原流程打过一次后再试")
+        return abort(L.T("sky_coords_missing", st.boss.name))
     end
 
     Streaming.clear()
@@ -1584,20 +1585,20 @@ local function nextScanStep()
         -- otherwise the failure says nothing about this boss.
         if st.scanLoadedMore then
             markUnsupportedIfGroundBoss()
-            return abort(st.boss.name .. " 暂不支持再战（找不到刷怪点）")
+            return abort(L.T("unsupported_no_spawner", st.boss.name))
         end
-        return abort("没能加载地图其他区域，暂时无法定位 " .. st.boss.name)
+        return abort(L.T("stream_fail", st.boss.name))
     end
     local ok, err = Streaming.moveTo(bell.loc)
     if not ok then
         U.log("streaming source failed: %s", tostring(err))
         Streaming.clear()
-        return abort("无法定位 Boss（加载区域失败）")
+        return abort(L.T("locate_stream_fail"))
     end
     st.stepAt = os.time()
     local done = st.scanTotal - #st.scanQueue
     U.log("scanning region %d/%d near %s", done, st.scanTotal, bell.id)
-    Toast.show(string.format("正在定位 %s（%d/%d）", st.boss.name, done, st.scanTotal), 4000)
+    Toast.show(L.T("locating", st.boss.name, done, st.scanTotal), 4000)
 end
 
 local function tickScanning()
@@ -1624,7 +1625,7 @@ local function tickScanning()
         Streaming.clear()
         U.log("map fully loaded (%d spawners, all resolved), boss has no spawner here", count)
         markUnsupportedIfGroundBoss()
-        return abort(st.boss.name .. " 暂不支持再战（地图中没有它的刷怪点）")
+        return abort(L.T("unsupported_no_map_spawner", st.boss.name))
     end
     nextScanStep()
 end
@@ -1762,7 +1763,7 @@ local function tickSpawning()
         dismissEarlyNextStage()
         st.revealArmed = false
         setPhase("preparing")
-        loadingToast("就位中…")
+        loadingToast(L.T("positioning"))
         return
     end
     if not st.altSpawnTried and elapsed() > ALT_SPAWN_AFTER_S and spawner then
@@ -1770,7 +1771,7 @@ local function tickSpawning()
         trySequenceSpawn(spawner)
     end
     if elapsed() > SPAWN_TIMEOUT_S then
-        abort(st.rootBoss and (st.boss.name .. " 没有出现，挑战结束") or "Boss 没有出现")
+        abort(st.rootBoss and L.T("boss_missing_named", st.boss.name) or L.T("boss_missing_end"))
     end
 end
 
@@ -1827,7 +1828,7 @@ local function beginFight()
     if not boss then boss = respawnBossForRematch() or reacquireBoss() end
     if not (boss and not isDead(boss) and bossLocUsable(U.location(boss))) then
         U.log("beginFight: no living boss after countdown, aborting")
-        return abort("Boss 未能刷出，挑战结束")
+        return abort(L.T("boss_spawn_fail_end"))
     end
     setBoss(boss)
     st.frozenKey, st.frozenClass = st.bossKey, st.bossClass
@@ -1850,7 +1851,7 @@ local function beginFight()
         st.fightGraceUntil = nil
     end
     setPhase("fighting")
-    Toast.show("开战：" .. st.boss.name, 2000)
+    Toast.show(L.T("fight_start", st.boss.name), 2000)
     -- Always set this boss's track. Otherwise the previous rematch's combat music keeps playing
     -- through phase 1 (seen with 舞狮尊主 still on 雷婷 / 剑欧's BGM).
     applyStageMusic(st.boss)
@@ -1867,7 +1868,7 @@ local function startCountdown()
         U.delay(i * 1000, "challenge.countdown", function()
             if st.phase ~= "countdown" or st.countdownId ~= id then return end
             if i < seconds then
-                Toast.show(string.format("准备迎战 %s  %d", st.boss.name, seconds - i), 1100)
+                Toast.show(L.T("countdown", st.boss.name, seconds - i), 1100)
             else
                 beginFight()
             end
@@ -1920,7 +1921,7 @@ local function tickPreparing()
             return
         end
         st.victoryRematchSpawn = nil
-        return abort("Boss 加载失败")
+        return abort(L.T("boss_load_failed"))
     end
     st.victoryRematchSpawn = nil
     st.prepareMissingLogged = nil
@@ -2227,7 +2228,7 @@ local function rematchAfterVictory()
     st.playerHealedForRematch = nil
     st.bossKey, st.bossClass = nil, nil
     st.frozenKey, st.frozenClass = nil, nil
-    Toast.show("再次迎战：" .. ((st.rootBoss or st.boss).name or ""), 3000)
+    Toast.show(L.T("rematch_again", (st.rootBoss or st.boss).name or ""), 3000)
     U.log("post-fight rematch: force respawn + countdown")
     if Config.LoadingCurtain ~= false then Curtain.cover() end
     setPlayerTransitFrozen(true)
@@ -2239,7 +2240,7 @@ local function rematchAfterVictory()
             -- Sequence spawn can lag; preparing will keep retrying while victoryRematchSpawn.
             U.log("victory rematch: spawn not ready yet, entering preparing to retry")
             setPhase("preparing")
-            loadingToast("刷出 Boss…")
+            loadingToast(L.T("spawning_boss"))
             return
         end
         st.victoryRematchSpawn = nil
@@ -2259,11 +2260,11 @@ local function victory()
     local name = (st.rootBoss or st.boss).name
     -- Default (F8 off): same as before — toast then restore saves / return to bell.
     if not EndChoice.isEnabled() then
-        Toast.show("挑战成功：" .. name .. "，即将返回", Config.VictoryReturnDelayMs)
+        Toast.show(L.T("victory_return", name), Config.VictoryReturnDelayMs)
         return returnToStart("victory", Config.VictoryReturnDelayMs)
     end
 
-    Toast.show("挑战成功：" .. name, 3000)
+    Toast.show(L.T("victory", name), 3000)
     setPhase("choosing")
     unfreezeBoss()
     setPlayerTransitFrozen(false)
@@ -2277,12 +2278,12 @@ local function victory()
             bossName = name,
             onRematch = rematchAfterVictory,
             onQuit = function()
-                Toast.show("退出挑战，正在返回出发铃铛…", 3000)
+                Toast.show(L.T("quitting_return"), 3000)
                 returnToStart("victory", 800)
             end,
         })
         if not ok then
-            Toast.show("挑战成功：" .. name .. "，即将返回", Config.VictoryReturnDelayMs)
+            Toast.show(L.T("victory_return", name), Config.VictoryReturnDelayMs)
             returnToStart("victory", Config.VictoryReturnDelayMs)
         end
     end)
@@ -2318,7 +2319,7 @@ local function enterStage(stage, pawn)
     st.frozenKey, st.frozenClass = st.bossKey, st.bossClass
     setFrozen(pawn, true)
     U.log("stage %s is up (preparing under curtain)", stage.id)
-    Toast.show("下一阶段：" .. stage.name, 3000)
+    Toast.show(L.T("next_stage", stage.name), 3000)
     setPhase("preparing")
 end
 
@@ -2337,7 +2338,7 @@ local function tickTransition()
     -- Slow loads (e.g. 七星阵大师兄 P2) look like a hang; keep reminding the player.
     if not st.transitionReminded and elapsed() >= STAGE_FADE_AT_S then
         st.transitionReminded = true
-        Toast.show(string.format("正在加载下一阶段：%s，请稍候…", stage.name), 10000)
+        Toast.show(L.T("next_stage_loading", stage.name), 10000)
     end
     if elapsed() >= STAGE_FADE_AT_S and Config.LoadingCurtain ~= false then Curtain.fadeOut(STAGE_FADE_S) end
     -- Do not adopt a live P2 until the wait ends — dying leftovers can still report IsDead=false.
@@ -2516,7 +2517,7 @@ local function tickFighting()
             st.fightGraceUntil = nil
             st.transitionReminded = nil
             st.transitionClearedEarly = nil
-            Toast.show(string.format("即将进入下一阶段：%s，请稍候…", nextStage.name), 12000)
+            Toast.show(L.T("next_stage_soon", nextStage.name), 12000)
             return setPhase("transition")
         end
         st.fightGraceUntil = nil
@@ -2530,7 +2531,7 @@ local function tickFighting()
             if st.missingBossSince == nil then st.missingBossSince = os.clock() end
             if os.clock() - st.missingBossSince > 8 then
                 st.missingBossSince = nil
-                return abort("Boss 丢失，挑战结束")
+                return abort(L.T("boss_lost_end"))
             end
         else
             st.missingBossSince = nil
@@ -2547,7 +2548,7 @@ rematchOnDefeat = function()
     st.defeatRetrying = true
     st.playerDied = false
     st.defeatUiWaitAt = nil
-    Toast.show("战败：在 Boss 面前复活…", 4000)
+    Toast.show(L.T("defeat_respawn"), 4000)
     U.log("rematch defeat: respawn in front of boss, then countdown")
     if Config.LoadingCurtain ~= false then Curtain.cover() end
     clearPlayerDeadWidgets()
@@ -2568,7 +2569,7 @@ rematchOnDefeat = function()
         if not (boss and not isDead(boss) and bossLocUsable(U.location(boss))) then
             U.log("defeat rematch: still no usable boss after respawn")
             st.defeatRetrying = false
-            Toast.show("挑战失败，即将返回", Config.DefeatReturnDelayMs)
+            Toast.show(L.T("defeat_return"), Config.DefeatReturnDelayMs)
             return returnToStart("defeat", Config.DefeatReturnDelayMs)
         end
         if Config.LoadingCurtain ~= false then Curtain.cover() end
@@ -2601,7 +2602,7 @@ rematchOnDefeat = function()
         if not dest then
             U.log("defeat: no valid stand loc (skyHop=%s), aborting rematch", tostring(st.skyArenaHop))
             st.defeatRetrying = false
-            Toast.show("挑战失败，即将返回", Config.DefeatReturnDelayMs)
+            Toast.show(L.T("defeat_return"), Config.DefeatReturnDelayMs)
             return returnToStart("defeat", Config.DefeatReturnDelayMs)
         end
 
@@ -2626,7 +2627,7 @@ rematchOnDefeat = function()
         st.defeatRetrying = false
         st.revealArmed = false
         setPhase("preparing")
-        Toast.show("再次迎战：" .. st.boss.name, 3000)
+        Toast.show(L.T("rematch_again", st.boss.name), 3000)
     end)
 end
 
@@ -2739,7 +2740,9 @@ local function snapToBell(bell, tag)
         if not sub then return false end
         local ok, err = pcall(function() sub:TeleportTo(FName(level), xf, FName(bell.id)) end)
         U.log("snap to %s %s via TeleportTo ok=%s %s", tag or "bell", bell.id, tostring(ok), ok and "" or tostring(err))
-        return ok
+        -- TeleportTo always needs a landing settle (second return); a single `ok` made
+        -- finishReload skip landing and reveal mid–World Partition.
+        return ok, ok and true or nil
     end
     -- Gravity off before the jump: the destination cells load after the pawn gets there.
     setPlayerTransitFrozen(true)
@@ -2777,13 +2780,17 @@ finishReload = function()
     U.log("=== challenge finished (%s), returning to bell", tostring(st.endReason))
     Save.clearState()
     -- Soft loads often leave the pawn at the arena; put them on the chosen ground bell.
-    local okSnap, _, moved = pcall(snapToFinishBell)
-    if okSnap and moved then
+    -- pcall → okCall, snapOk, needsLanding
+    local okCall, snapOk, needsLanding = pcall(snapToFinishBell)
+    if okCall and snapOk and needsLanding then
         -- Revealing right after a long jump dropped the player through ground that had not
         -- loaded yet. Stay black and weightless until streaming there has finished.
         setPhase("landing")
         st.landingIdleTicks = 0
         return
+    end
+    if not okCall then
+        U.log("snapToFinishBell error: %s", tostring(snapOk))
     end
     completeReturn()
 end
@@ -2807,11 +2814,11 @@ completeReturn = function()
     end)
     U.delay(1500, "challenge.backToast", function()
         if reason == "victory" then
-            Toast.show("挑战完成，已回到 Boss 附近铃铛", 3000)
+            Toast.show(L.T("done_near_boss_bell"), 3000)
         elseif reason == "quit" then
-            Toast.show("已退出挑战，回到出发铃铛", 3000)
+            Toast.show(L.T("done_start_bell"), 3000)
         else
-            Toast.show("已返回出发铃铛", 3000)
+            Toast.show(L.T("done_returned"), 3000)
         end
     end)
 end
@@ -2971,7 +2978,11 @@ function M.onPlayerDeadWidget()
 end
 
 function M.onMapLoaded()
-    Curtain.hold()
+    -- Do not SetManualCameraFade from LoadMap PostHook unless streaming is idle —
+    -- same crash class as holding fade mid–World Partition travel.
+    if Curtain.holdAllowed() and Streaming.idle() then
+        Curtain.hold()
+    end
     if st.phase == "reloading" then
         U.log("map loaded while reloading")
     end
@@ -2983,7 +2994,7 @@ function M.forceEnd(reason)
     if st.phase == "landing" then return completeReturn() end
     EndChoice.hide()
     U.log("force end: %s", tostring(reason))
-    Toast.show("宿敌再战出错，正在返回", 4000)
+    Toast.show(L.T("error_returning"), 4000)
     returnToStart("error", 1500)
 end
 
@@ -2998,7 +3009,7 @@ function M.quit()
     st.countdownId = nil
     st.prepareRevealId = nil
     st.choiceToken = nil
-    Toast.show("退出挑战，正在返回出发铃铛…", 3000)
+    Toast.show(L.T("quitting_return"), 3000)
     returnToStart("quit", 800)
 end
 

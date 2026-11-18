@@ -4,6 +4,7 @@
 local U = require("util")
 local Config = require("config")
 local Toast = require("toast")
+local L = require("locale")
 
 local M = {}
 
@@ -248,8 +249,8 @@ end
 
 function M.toggle()
     local on = M.setEnabled(not M.isEnabled())
-    Toast.show(on and "已开启：胜利后选择再战或退出（F8 关闭）"
-        or "已关闭：胜利后直接返回铃铛（F8 开启）", 3500)
+    local key = Config.PostFightChoiceToggleKey or "F8"
+    Toast.show(on and L.T("choice_enabled", key) or L.T("choice_disabled", key), 3500)
     return on
 end
 
@@ -313,9 +314,9 @@ function M.show(opts)
     focusIndex = 1
     padLatch = {}
 
-    titleKey = makeButton("挑战成功：" .. name, 0.5, 0.32, false)
-    rematchKey = makeButton("再战", 0.38, 0.48, true)
-    quitKey = makeButton("退出", 0.62, 0.48, true)
+    titleKey = makeButton(L.T("victory_title", name), 0.5, 0.32, false)
+    rematchKey = makeButton(L.T("rematch"), 0.38, 0.48, true)
+    quitKey = makeButton(L.T("quit"), 0.62, 0.48, true)
     if not rematchKey or not quitKey then
         U.log("endchoice: buttons missing, falling back to quit")
         M.reset()

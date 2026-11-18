@@ -6,16 +6,21 @@ return {
     -- 存档所在的 Steam 用户文件夹名（ProjectPBZ/Saved/SaveGames/Steam/ 下的数字文件夹）
     SteamId = "",
 
+    -- UI 语言：auto = 跟随铃铛菜单已显示的文案（避免中文 Steam Culture=zh 误判）；
+    -- 也可强制 "zh" / "en"
+    Language = "auto",
+
     -- 挑战中主动退出并返回出发铃铛（Home 快捷键 + 系统菜单「退出游戏」页里的按钮）
     ExitKey = "HOME",
-    ExitLabel = "退出挑战",
+    -- 留空则用 locale（中文「退出挑战」/ 英文 Quit Challenge）；填了则强制覆盖
+    ExitLabel = "",
     -- 「退出挑战」按钮在「退出游戏」页里的位置，都是屏幕高度的比例：X 从屏幕左边算起，Y 从顶部算起。
     -- 默认值对应列表第四行；位置偏了就改这两个数。
     ExitButtonX = 0.087,
     ExitButtonY = 0.49,
 
-    -- 挑战中一键击杀当前 Boss（测试用，设为 false 关闭；UE4SS 键名是 DEL）
-    EnableKillKey = true,
+    -- 挑战中一键击杀当前 Boss（测试用，发布包默认关；UE4SS 键名是 DEL）
+    EnableKillKey = false,
     KillKey = "DEL",
 
     -- 胜利 / 失败后多久自动返回（毫秒）。胜利稍长一点，留给「斩」字和死亡演出。
@@ -39,8 +44,8 @@ return {
     -- 是否只显示已在图鉴中解锁的 Boss
     OnlyDiscovered = true,
 
-    -- 铃铛菜单入口按钮文字
-    EntryLabel = "宿敌再战",
+    -- 铃铛菜单入口按钮文字；留空则用 locale（中文「宿敌再战」/ 英文 Boss Rematch）
+    EntryLabel = "",
 
     -- 挑战胜利后弹出「再战 / 退出」选择（默认关，保持原先「斩」后回铃铛）。
     -- 游戏内按下面的键开关；开关状态会写入 data/prefs.lua。
