@@ -513,6 +513,30 @@ local function hardFreezeBoss(pawn)
     setFrozen(pawn, true)
 end
 
+-- Soft-rescued / countdown-frozen bosses sometimes keep dilation 0 or MOVE_None after a
+-- single FreezeCharacter(false). Clear slot and reassert movement + AI hard.
+local function forceUnfreezeBoss(pawn)
+    if not U.valid(pawn) then return end
+    st.bossFreezeKey = nil
+    pcall(function() pawn.CustomTimeDilation = 1.0 end)
+    pcall(function()
+        local mesh = pawn.Mesh
+        if U.valid(mesh) then mesh.GlobalAnimRateScale = 1.0 end
+    end)
+    local controller = controllerOf(pawn)
+    if controller then pcall(function() controller.CustomTimeDilation = 1.0 end) end
+    setFrozen(pawn, false)
+    -- Soft teleport rescue can leave CMC in MOVE_None; walking must come back for combat.
+    pcall(function()
+        local move = pawn.CharacterMovement
+        if U.valid(move) then
+            pcall(function() move:SetMovementMode(1) end)
+        end
+    end)
+    -- Second pass: some controllers reattach a beat after StartAI.
+    pcall(function() pawn:FreezeCharacter(false) end)
+end
+
 setPlayerTransitFrozen = function(frozen)
     local pawn = U.playerPawn()
     if frozen then
@@ -550,13 +574,20 @@ setPlayerTransitFrozen = function(frozen)
 end
 
 local function unfreezeBoss()
+    local p = nil
     if st.frozenKey then
-        local p = U.live(st.frozenClass, st.frozenKey) or bossPawn()
-        if p then setFrozen(p, false) end
-        U.log("boss released")
-        st.frozenKey, st.frozenClass = nil, nil
+        p = U.live(st.frozenClass, st.frozenKey) or bossPawn()
+    else
+        p = bossPawn()
     end
+    if p then
+        forceUnfreezeBoss(p)
+        U.log("boss released")
+    end
+    st.frozenKey, st.frozenClass = nil, nil
     st.bossFreezeKey = nil
+    -- Keep forcing unfreeze for a couple seconds; soft-rescued bosses can re-stick.
+    st.unfreezeUntil = os.clock() + 2.5
 end
 
 -- Despawn the rematch boss so it cannot linger / re-aggro at the return bell.
@@ -2457,6 +2488,7 @@ local function tickFighting()
 
     -- Player death has priority: freeze boss during 陨落, then rematch (never false-victory).
     if st.playerDied then
+        st.unfreezeUntil = nil
         local hold = bossPawn()
         if not hold or not bossLocUsable(U.location(hold)) then
             hold = reacquireBoss()
@@ -2476,6 +2508,13 @@ local function tickFighting()
     end
 
     local boss = bossPawn()
+    -- Soft-rescued bosses (e.g. 炎如 spawner Z≈2e6) can log as released but stay frozen;
+    -- reassert for a short window after beginFight.
+    if boss and not isDead(boss) and st.unfreezeUntil and os.clock() < st.unfreezeUntil then
+        forceUnfreezeBoss(boss)
+    elseif st.unfreezeUntil and os.clock() >= st.unfreezeUntil then
+        st.unfreezeUntil = nil
+    end
     if not boss or isDead(boss) then
         local again = reacquireBoss()
         if again and not isDead(again) then

@@ -31,6 +31,7 @@ local inputTaken = false
 local focusIndex = 1
 local appearanceIndex = nil -- last index we applied DoSelectedAppearance for
 local padLatch = {}
+local lastInputRefresh = nil
 
 -- Runtime override; nil means "use Config + prefs".
 local enabledOverride = nil
@@ -213,6 +214,7 @@ function M.reset()
     focusIndex = 1
     appearanceIndex = nil
     padLatch = {}
+    lastInputRefresh = nil
     releaseUiInput()
 end
 
@@ -439,6 +441,16 @@ function M.tick()
         U.log("endchoice: buttons gone, hiding")
         M.hide()
         return
+    end
+    -- Alt-tab / focus loss drops the cursor and UI-only input; re-assert while open.
+    local pc = U.playerController()
+    local cursorOn = false
+    pcall(function() cursorOn = pc and pc.bShowMouseCursor == true end)
+    local now = os.clock()
+    if (not cursorOn) or (not lastInputRefresh) or (now - lastInputRefresh) > 0.5 then
+        lastInputRefresh = now
+        local focus = focusIndex == 1 and rematch or quit
+        takeUiInput(focus)
     end
     -- Do NOT rewrite labels / DoSelectedAppearance / enableClickable every tick:
     -- that fights the button's hover anim and makes 再战/退出 flash.
