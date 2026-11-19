@@ -442,15 +442,17 @@ function M.tick()
         M.hide()
         return
     end
-    -- Alt-tab / focus loss drops the cursor and UI-only input; re-assert while open.
+    -- Alt-tab / focus loss drops the cursor and UI-only input; only re-assert when lost
+    -- (not every tick — that steals focus and fights mouse hover).
     local pc = U.playerController()
     local cursorOn = false
     pcall(function() cursorOn = pc and pc.bShowMouseCursor == true end)
     local now = os.clock()
-    if (not cursorOn) or (not lastInputRefresh) or (now - lastInputRefresh) > 0.5 then
+    if (not cursorOn) and ((not lastInputRefresh) or (now - lastInputRefresh) > 0.35) then
         lastInputRefresh = now
         local focus = focusIndex == 1 and rematch or quit
         takeUiInput(focus)
+        U.log("endchoice: reassert mouse/UI input after focus loss")
     end
     -- Do NOT rewrite labels / DoSelectedAppearance / enableClickable every tick:
     -- that fights the button's hover anim and makes 再战/退出 flash.

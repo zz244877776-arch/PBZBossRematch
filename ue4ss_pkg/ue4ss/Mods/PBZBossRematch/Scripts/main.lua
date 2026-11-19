@@ -126,6 +126,8 @@ NotifyOnNewObject("/Script/UMG.UserWidget", function(widget)
 end)
 
 RegisterLoadMapPostHook(function()
+    -- Same crash class as world-change: fade on a half-ready camera during WP settle.
+    Curtain.blockHold(3.0)
     BellUI.reset()
     QuitUI.reset()
     EndChoice.reset()

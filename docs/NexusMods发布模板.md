@@ -50,7 +50,7 @@ Re-fight any boss you have already defeated, straight from the bell menu. A new 
 [*][b]Bell menu entry[/b] - a new "宿敌再战" option in every bell menu, listing the bosses you have defeated, grouped by region. Works with mouse, keyboard and gamepad.
 [*][b]Temporary challenge[/b] - your save is snapshotted before the fight. Win, lose or quit, it is restored and you are sent back to the bell you started from. Progress, items and kills stay exactly as they were.
 [*][b]Loading screen[/b] - the screen stays black while the mod travels, finds the boss and loads the arena, then fades in.
-[*][b]Pre-fight countdown[/b] - the boss is frozen for a 3-second countdown so you can get ready.
+[*][b]Pre-fight countdown[/b] - the boss is frozen for an 8-second countdown (configurable) so you can get ready.
 [*][b]Multi-phase bosses[/b] - phase two follows phase one with a fade-out transition, and the fight only counts as won after the last phase.
 [*][b]Crash protection[/b] - if the game closes mid-challenge, your save is restored automatically on the next launch.
 [/list]
@@ -112,7 +112,7 @@ Please attach [i]platform\steam\ue4ss\Mods\PBZBossRematch\data\rematch.log[/i] a
 [*][b]铃铛菜单入口[/b]：每个铃铛菜单新增「宿敌再战」，按地区列出已击败的 Boss，支持鼠标、键盘和手柄。
 [*][b]临时挑战[/b]：开战前快照存档，胜利、失败或中途退出都会还原存档，并回到出发的铃铛，进度、物品、击杀记录都不变。
 [*][b]加载黑屏[/b]：传送、定位 Boss、加载战场期间保持黑屏，准备好再淡入画面。
-[*][b]开战倒计时[/b]：画面出现后 Boss 定格，倒数 3 秒再开打。
+[*][b]开战倒计时[/b]：画面出现后 Boss 定格，默认倒数 8 秒再开打（可在 config 里改）。
 [*][b]多阶段 Boss[/b]：一阶段结束后淡入黑屏转入二阶段，打完最后一个阶段才算胜利。
 [*][b]防崩溃[/b]：挑战中途游戏关闭或崩溃，下次启动会自动还原存档。
 [/list]

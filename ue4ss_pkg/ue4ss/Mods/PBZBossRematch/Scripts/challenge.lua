@@ -343,8 +343,9 @@ local function rescueSoftBossToPlayer(boss)
         tostring(ok), tostring(moved), dest.X, dest.Y, dest.Z, tostring(b and b.Z))
     if not moved then return false end
     setBoss(boss)
+    -- Session-only: do NOT rememberArenaLoc(player+250). That poisoned the cache so the
+    -- next rematch hopped to a random roadside instead of the real spawner.
     st.spawnerLoc = dest
-    Data.rememberArenaLoc(st.rootBoss or st.boss, dest, st.spawnerId)
     return true
 end
 

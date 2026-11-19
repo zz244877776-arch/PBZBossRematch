@@ -62,6 +62,9 @@ end
 function M.hold()
     if state ~= "covered" then return end
     if not M.holdAllowed() then return end
+    -- cover()/fadeDone also call hold(); skip SetManualCameraFade until WP streaming is idle.
+    local okS, Streaming = pcall(require, "streaming")
+    if okS and Streaming and Streaming.idle and not Streaming.idle() then return end
     withCamera(function(cm) cm:SetManualCameraFade(1.0, BLACK, false) end)
 end
 

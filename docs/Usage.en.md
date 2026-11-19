@@ -71,9 +71,9 @@ UE4SS is the Phantom Blade Zero package from KintaroModding (v3.0.1-1195). MIT l
 
 - Only bosses unlocked in the codex (when `OnlyDiscovered` is on).
 - Follow-up phases of multi-phase bosses and tutorial fights are hidden; they are entered from phase 1.
-- Names marked **（未勘察）** (not surveyed) mean the mod has not cached that boss’s arena yet. World Partition may not have that cell loaded, so the mod first travels to a bell on that map, then quietly streams regions to locate the boss (toast: “正在定位…”; your character does not walk around). The first visit can take a few extra seconds; later rematches go straight there.
+- Bosses in the list (except those marked unsupported) are generally challengeable. On a first rematch, if the arena isn’t cached yet, the mod travels to a map bell then quietly streams regions to locate the boss (toast: “Locating…”). The first visit can take a few extra seconds; later rematches are faster.
 - Other bosses discovered during that scan are cached too. While you explore normally, the mod also records nearby bosses about every 30 seconds.
-- Names marked **（暂不支持）** (unsupported) mean no spawner was found on that map (often sequence- or special-space-only bosses). Choosing them will not teleport you into a fight.
+- Names marked **（暂不支持）** / **(unsupported)** mean no spawner was found on that map (often sequence- or special-space-only bosses). Choosing them will not teleport you into a fight.
 
 ---
 
@@ -98,12 +98,12 @@ Edit `platform\steam\ue4ss\Mods\PBZBossRematch\Scripts\config.lua` in a text edi
 | Option | Default | Meaning |
 |---|---|---|
 | `ExitKey` | `"HOME"` | Quit-challenge key |
-| `EnableKillKey` | `true` | Instant-kill hotkey; set `false` to disable |
-| `KillKey` | `"END"` | Instant-kill key |
+| `EnableKillKey` | `false` | Instant-kill hotkey; set `true` to enable |
+| `KillKey` | `"DEL"` | Instant-kill key |
 | `VictoryReturnDelayMs` | `8000` | Ms to wait after victory before returning |
 | `DefeatReturnDelayMs` | `7000` | Ms to wait after defeat before returning |
 | `LoadingCurtain` | `true` | Black screen while traveling / loading the boss; set `false` to disable |
-| `CountdownSeconds` | `3` | Frozen-boss countdown after reveal; `0` skips countdown |
+| `CountdownSeconds` | `8` | Frozen-boss countdown after reveal; `0` skips countdown |
 | `OnlyDiscovered` | `true` | Only list codex-unlocked bosses |
 | `HiddenBossPatterns` | see file | Codex rows hidden from the list |
 | `EntryLabel` | `"宿敌再战"` | Bell-menu button label |

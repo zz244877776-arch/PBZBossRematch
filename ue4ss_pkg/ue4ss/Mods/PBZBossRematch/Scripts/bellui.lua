@@ -420,12 +420,24 @@ local function backToMenu()
 end
 
 local function showBossList(mapId, bosses)
+    -- Challengeable first; proven-unsupported last so （暂不支持） is easy to spot.
+    local ordered = {}
+    for _, b in ipairs(bosses) do table.insert(ordered, b) end
+    table.sort(ordered, function(a, b)
+        local ua = Data.arena(a.id)
+        local ub = Data.arena(b.id)
+        local aBad = ua and ua.unsupported and true or false
+        local bBad = ub and ub.unsupported and true or false
+        if aBad ~= bBad then return not aBad end
+        return tostring(a.name) < tostring(b.name)
+    end)
+
     local entries = {}
-    for _, b in ipairs(bosses) do
+    for _, b in ipairs(ordered) do
         local arena = Data.arena(b.id)
-        local suffix = ""
-        if not arena then suffix = L.T("not_scouted_tag")
-        elseif arena.unsupported then suffix = L.T("unsupported_tag") end
+        -- Do not show "未勘察": missing arena cache only means first trip uses the map
+        -- bell (slower). Keep "暂不支持" for bosses that already failed a full scan.
+        local suffix = (arena and arena.unsupported) and L.T("unsupported_tag") or ""
         table.insert(entries, {
             label = b.name .. suffix,
             action = function()

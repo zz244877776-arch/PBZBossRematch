@@ -894,26 +894,45 @@ function M.learnArenas()
                 local any = c.list[1]
                 local skyBell = any and M.nearestBell(b.map, any.loc) or nil
                 local sky = any and U.isSkyArenaLoc(any.loc)
-                -- Pocket arenas (暗魔天堡): keep full XYZ so rematch can teleport the player in.
-                -- Other soft/void junk: keep XY + nearest bell only.
-                arenaCache[b.id] = {
-                    map = b.map,
-                    bell = skyBell and skyBell.id or "",
-                    x = any and math.floor(any.loc.X) or nil,
-                    y = any and math.floor(any.loc.Y) or nil,
-                    z = sky and math.floor(any.loc.Z) or nil,
-                    spawnerId = any and U.str(any.spawner.SpawnerID) or "",
-                    skyArena = sky or nil,
-                    skyInvalid = not sky,
-                    farFromMap = true,
-                }
-                learned = learned + 1
-                U.log("arena learn sky/off-map %s: bell=%s xy=(%s,%s) z=%s skyArena=%s",
-                    b.id, arenaCache[b.id].bell, tostring(arenaCache[b.id].x), tostring(arenaCache[b.id].y),
-                    tostring(arenaCache[b.id].z), tostring(sky))
+                -- Soft/void junk must not wipe a proven "unsupported" mark — that made the
+                -- rematch list never show （暂不支持） after a failed full-map scan.
+                if prev and prev.unsupported and not sky then
+                    if skyBell and (not prev.bell or prev.bell == "") then
+                        prev.bell = skyBell.id
+                    end
+                    if any and prev.x == nil then
+                        prev.x = math.floor(any.loc.X)
+                        prev.y = math.floor(any.loc.Y)
+                    end
+                    prev.skyInvalid = true
+                    prev.farFromMap = true
+                    arenaCache[b.id] = prev
+                    U.log("arena learn: keep unsupported for %s (soft spawner only)", b.id)
+                else
+                    -- Pocket arenas (暗魔天堡): keep full XYZ so rematch can teleport in.
+                    -- Other soft/void junk: keep XY + nearest bell only.
+                    arenaCache[b.id] = {
+                        map = b.map,
+                        bell = skyBell and skyBell.id or "",
+                        x = any and math.floor(any.loc.X) or nil,
+                        y = any and math.floor(any.loc.Y) or nil,
+                        z = sky and math.floor(any.loc.Z) or nil,
+                        spawnerId = any and U.str(any.spawner.SpawnerID) or "",
+                        skyArena = sky or nil,
+                        skyInvalid = not sky,
+                        farFromMap = true,
+                        -- Real sky pockets are challengeable; only soft junk may keep unsupported.
+                        unsupported = sky and nil or (prev and prev.unsupported) or nil,
+                    }
+                    learned = learned + 1
+                    U.log("arena learn sky/off-map %s: bell=%s xy=(%s,%s) z=%s skyArena=%s",
+                        b.id, arenaCache[b.id].bell, tostring(arenaCache[b.id].x), tostring(arenaCache[b.id].y),
+                        tostring(arenaCache[b.id].z), tostring(sky))
+                end
             else
                 local s, loc = pick.spawner, pick.loc
                 learned = learned + 1
+                -- A real ground spawner means rematch is possible again.
                 arenaCache[b.id] = {
                     map = b.map,
                     x = math.floor(loc.X), y = math.floor(loc.Y), z = math.floor(loc.Z),
